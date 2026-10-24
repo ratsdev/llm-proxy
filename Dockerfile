@@ -31,16 +31,11 @@ FROM alpine:3
 
 # alpine:3 already ships the Mozilla CA bundle at
 # /etc/ssl/certs/ca-certificates.crt, so no apk fetch is needed for TLS.
-RUN addgroup -S -g 10001 llm-proxy \
- && adduser -S -D -H -u 10001 -G llm-proxy llm-proxy
-
 COPY --from=build /out/llm-proxy /usr/local/bin/llm-proxy
 
-# Configuration is mounted at runtime, never baked into the image.
-RUN mkdir -p /etc/llm-proxy \
- && chown llm-proxy:llm-proxy /etc/llm-proxy
-
-USER llm-proxy:llm-proxy
+# Configuration is mounted at runtime, never baked into the image. The process
+# runs as root so it can read a config mounted at mode 0600 and owned by root.
+RUN mkdir -p /etc/llm-proxy
 
 EXPOSE 4000
 

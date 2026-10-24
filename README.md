@@ -101,7 +101,7 @@ Images are published to `ghcr.io/ratsdev/llm-proxy` and to Docker Hub as `docker
 
 Use `stable` for production and pin an exact version when reproducibility matters; `latest` intentionally tracks the newest build and may include release candidates.
 
-The image runs as an unprivileged user (`10001:10001`) and reads its config from `/etc/llm-proxy/config.toml`. Mount the file read-only; never bake credentials into the image.
+The image reads its config from `/etc/llm-proxy/config.toml` and runs as `root`, which lets it read a mounted file that is owned by root and kept at mode `0600`. Mount the file read-only; never bake credentials into the image. If you prefer an unprivileged container, start it with `--user` and make the mounted config readable by that UID.
 
 ### CLI flags
 
