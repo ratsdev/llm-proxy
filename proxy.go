@@ -46,6 +46,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, spec routeS
 		s.fail(w, r, apiErr)
 		return
 	}
+	log.user = userID(user)
+	log.model = modelID
+	log.inbound = spec.wire
 	log.add("user", userID(user), "model", modelID)
 
 	inbound := adapterFor(spec.wire)
@@ -61,6 +64,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, spec routeS
 		PreferredFormat: spec.wire,
 		Payload:         payload,
 	}
+	log.stream = routeRequest.Stream
 	log.add("stream", routeRequest.Stream)
 
 	result, err := s.router.Send(r.Context(), routeRequest)
@@ -78,6 +82,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, spec routeS
 		s.fail(w, r, util.New(500, "Internal server error.", "api_error", "internal_error", nil))
 		return
 	}
+	log.provider = result.ProviderID
+	log.upstreamModel = result.UpstreamModel
+	log.upstream = result.WireFormat
 	if !result.OK() {
 		log.add("provider", result.ProviderID)
 		s.fail(w, r, upstreamError(result))
@@ -214,6 +221,9 @@ func (s *Server) relayPassthroughJSON(w http.ResponseWriter, r *http.Request, re
 	}
 
 	spec.inbound.RewriteModel(object, spec.modelID)
+	if usage, ok := usageFromObject(object); ok {
+		spec.log.usage = &usage
+	}
 	s.writeRelayJSON(w, r, result, object, spec.log)
 }
 
@@ -268,6 +278,14 @@ func (s *Server) relayPassthroughSSE(w http.ResponseWriter, r *http.Request, res
 		if rewritten, ok := rewriteStreamModel(line, spec.modelID); ok {
 			line = rewritten
 		}
+		if usage, ok := usageFromStreamLine(line); ok {
+			current := ir.Usage{}
+			if spec.log.usage != nil {
+				current = *spec.log.usage
+			}
+			merged := current.Merged(&usage)
+			spec.log.usage = &merged
+		}
 		if len(line) > 0 {
 			if _, writeErr := w.Write(line); writeErr != nil {
 				s.logger.Debug("client disconnected during stream", append(spec.log.attrs, "error", writeErr)...)
@@ -304,6 +322,14 @@ func (s *Server) relayConvertSSE(w http.ResponseWriter, r *http.Request, result 
 			return feedErr
 		}
 		for _, streamEvent := range events {
+			if streamEvent.Usage != nil {
+				current := ir.Usage{}
+				if spec.log.usage != nil {
+					current = *spec.log.usage
+				}
+				merged := current.Merged(streamEvent.Usage)
+				spec.log.usage = &merged
+			}
 			terminal := streamEvent.Type == ir.StreamError
 			frames, encodeErr := encoder.Encode(streamEvent)
 			if encodeErr != nil {
@@ -464,6 +490,61 @@ func rewriteStreamModel(line []byte, modelID string) ([]byte, bool) {
 		return nil, false
 	}
 	return []byte("data: " + string(rewritten) + "\n"), true
+}
+
+// usageFromObject extracts token accounting from a JSON response. Both OpenAI
+// key families and Anthropic's cache fields are understood so same-wire
+// passthrough traffic still contributes to the Web UI usage summary.
+func usageFromObject(object map[string]any) (ir.Usage, bool) {
+	if usage, ok := usageFromPayload(object); ok {
+		return usage, true
+	}
+	for _, nestedKey := range []string{"message", "response"} {
+		if nested, ok := util.AsMap(object[nestedKey]); ok {
+			if usage, ok := usageFromPayload(nested); ok {
+				return usage, true
+			}
+		}
+	}
+	return ir.Usage{}, false
+}
+
+func usageFromPayload(object map[string]any) (ir.Usage, bool) {
+	raw, ok := util.AsMap(object["usage"])
+	if !ok || len(raw) == 0 {
+		return ir.Usage{}, false
+	}
+	if _, ok := raw["prompt_tokens"]; ok {
+		return protocols.ParseUsage(raw, "prompt_tokens", "completion_tokens"), true
+	}
+	usage := protocols.ParseUsage(raw, "input_tokens", "output_tokens")
+	if cached, ok := util.AsInt(raw["cache_read_input_tokens"]); ok {
+		usage.CacheReadInputTokens = cached
+	}
+	if created, ok := util.AsInt(raw["cache_creation_input_tokens"]); ok {
+		usage.CacheCreationInputTokens = created
+	}
+	return usage, true
+}
+
+func usageFromStreamLine(line []byte) (ir.Usage, bool) {
+	text := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(text, "data:") {
+		return ir.Usage{}, false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(text, "data:"))
+	if payload == "" || payload == "[DONE]" || !strings.Contains(payload, `"usage"`) {
+		return ir.Usage{}, false
+	}
+	value, err := util.Decode([]byte(payload))
+	if err != nil {
+		return ir.Usage{}, false
+	}
+	object, ok := util.AsMap(value)
+	if !ok {
+		return ir.Usage{}, false
+	}
+	return usageFromObject(object)
 }
 
 func inboundStreamFlags(wire WireFormat, payload map[string]any) (stream, includeUsage bool) {

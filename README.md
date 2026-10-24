@@ -31,6 +31,7 @@ A self-hosted, multi-protocol LLM gateway written in Go. Give every client one e
 - **Multimodal and tools.** Text, images, video input, tool calls/results, reasoning/thinking content, stop sequences, and Anthropic prompt-cache hints survive protocol hops.
 - **Authentication and ACLs.** API-key users with optional per-user model allow-lists. Authentication is disabled when no users are configured.
 - **Model catalog.** OpenAI-compatible `GET /api/v1/models` and `GET /api/v1/models/{id}`, filtered by the caller's ACL.
+- **Read-only Web UI.** A built-in console at `/ui` for models, providers, usage, and recent requests. It is unlocked with an API key and can never modify configuration.
 - **Operational niceties.** Health endpoint, one access-log line per API operation, request IDs, provider response headers, graceful shutdown, and a small multi-stage Docker image.
 
 ## Supported endpoints
@@ -50,6 +51,7 @@ The gateway also exposes:
 | `GET /api/health` | Unauthenticated health probe |
 | `GET /api/v1/models` | OpenAI-style model list (ACL-filtered) |
 | `GET /api/v1/models/{model_id}` | Model metadata (ACL-checked) |
+| `GET /ui` | Read-only Web UI, unlocked with an API key |
 
 A provider may declare several endpoints. The router prefers the endpoint that matches the inbound wire format and otherwise falls back to the first compatible chat-family endpoint, converting as needed.
 
@@ -75,7 +77,7 @@ go build -o bin/llm-proxy ./cmd/llm-proxy
 ./bin/llm-proxy --config config.toml
 ```
 
-The gateway listens on `0.0.0.0:4000` by default. Every API route lives under `/api`, so the base URL is `http://127.0.0.1:4000/api/`; paths outside that prefix return `404`. Append `/v1` for OpenAI-style clients (for example `http://127.0.0.1:4000/api/v1`).
+The gateway listens on `0.0.0.0:4000` by default. Every API route lives under `/api`, so the base URL is `http://127.0.0.1:4000/api/`; unknown paths outside the UI and API prefixes return `404`. Append `/v1` for OpenAI-style clients (for example `http://127.0.0.1:4000/api/v1`). The Web UI is at `http://127.0.0.1:4000/ui` and signs in with any configured user `api_key`.
 
 ### Docker
 
@@ -209,6 +211,29 @@ If no weights are declared, every provider gets weight `1.0` (equal selection pr
 | `allowed_models` | no | Model allow-list. Omit for unrestricted access; `"*"` is a wildcard. |
 
 **Authentication is disabled entirely when there are no `[[users]]`.** Do not expose an unauthenticated instance to the internet.
+
+## Web UI
+
+Open `http://127.0.0.1:4000/ui` and sign in with any `api_key` from the `[[users]]` section. The console is **read-only**: it has no endpoints for changing providers, models, users, or routing. Configuration changes still require editing `config.toml` and restarting the process.
+
+The console's API lives under `/api/ui`: `POST /api/ui/login`, `POST /api/ui/logout`, and the session-scoped `GET /api/ui/session`, `/api/ui/overview`, `/api/ui/models`, `/api/ui/providers`, and `/api/ui/requests`.
+
+| Page | Shows |
+| --- | --- |
+| Overview | Gateway version, uptime, success rate, token totals, 24-hour activity, traffic by model and provider, recent requests |
+| Models | Public model aliases with context/output metadata, modalities, provider bindings, upstream model names, and weights |
+| Providers | Provider protocol, base URL, endpoints, retry/timeout settings, proxy scheme, and which of your models use it |
+| Requests | Recent model traffic owned by the signed-in key: request ID, model, provider, protocol, stream flag, status, latency, and tokens |
+| Account | Your user ID, session expiry, and model allow-list |
+
+The UI honours each user's `allowed_models` ACL: models, providers, and request history are all scoped to the signed-in key. Provider keys, custom headers, and other users' API keys are never sent to the browser.
+
+Details worth knowing:
+
+- **Key login only.** Login exchanges a configured API key for an in-memory session cookie (`HttpOnly`, `SameSite=Strict`, 12-hour TTL). Raw keys are not stored in browser storage. Restarting the gateway invalidates every session.
+- **No users, no UI.** When there are no `[[users]]`, the Web UI returns `403` with an explanation instead of exposing an unauthenticated console.
+- **In-memory statistics.** The dashboard and request log keep the latest 5,000 model requests in process memory. They reset on restart, and they are not a billing or audit system.
+- **No writes.** Every UI API route is `GET` except login/logout; other methods return `405`. The only browser state is the session cookie.
 
 ## Usage
 
@@ -350,7 +375,8 @@ Streaming behavior:
 - **Logging:** one structured access-log line per API operation, including request ID, user, model, provider, stream flag, status, duration, and token usage when known. Health and index probes are not logged.
 - **Timeouts:** model timeout overrides provider timeout, which defaults to 600 seconds. The timeout applies to the request and to stream inactivity.
 - **Shutdown:** `SIGINT`/`SIGTERM` triggers a graceful shutdown with a 30-second deadline.
-- **Reloading:** configuration is loaded once at startup. Restart the process to apply changes.
+- **Reloading:** configuration is loaded once at startup. Restart the process to apply changes. Restarting also clears Web UI sessions and request history.
+- **Web UI:** `/ui` is a read-only console; its login, session, and metrics state live in process memory. UI traffic is not included in the request statistics.
 - **TLS:** the gateway speaks plain HTTP. Terminate TLS in a reverse proxy or ingress.
 
 ## Architecture
@@ -365,6 +391,8 @@ Every request is parsed into a small protocol-neutral IR (`ir/`), routed to a pr
 | `router.go` | Candidate selection, weighted order, retries, failover, sticky cache |
 | `wire.go` | Single source of truth for inbound routes and provider endpoints |
 | `config.go` | TOML loading and validation |
+| `ui.go` | Read-only Web UI handlers, key-derived sessions, request history |
+| `assets/` | Embedded HTML/CSS/JS console assets (no build step) |
 | `client.go` | Upstream HTTP clients, timeouts, HTTP/SOCKS5 proxies |
 | `ir/` | Protocol-neutral request, response, content block, and stream event types |
 | `protocols/` | Adapter contract plus OpenAI and Anthropic implementations |
@@ -392,14 +420,16 @@ go build -trimpath \
 - No embeddings translation; embeddings only pass through to `/embeddings` upstreams.
 - Anthropic-protocol providers cannot receive video content.
 - Cross-wire conversion covers the common chat surface, not every vendor-specific extension.
-- No per-user rate limiting, quotas, cost accounting, admin UI, or config hot reload.
+- No per-user rate limiting, quotas, cost accounting, write/admin UI, or config hot reload. The Web UI is display-only.
+- Web UI statistics are per-process and in-memory; they are not persisted and do not survive a restart.
 - Sticky routing is per-process and in-memory.
 - No built-in TLS termination.
 
 ## Security
 
 - Provider keys and user API keys are stored in plaintext in `config.toml`. Keep the file mode `0600`, mount it read-only in containers, and never commit it.
-- With no `[[users]]`, anyone who can reach the port can use every model. Put the gateway behind a private network, VPN, or authenticating reverse proxy.
+- With no `[[users]]`, anyone who can reach the port can use every model and the Web UI stays disabled. Put the gateway behind a private network, VPN, or authenticating reverse proxy.
+- The Web UI exchanges an API key for a session cookie and never exposes provider keys, custom headers, or other users' keys. Serve it over HTTPS through your reverse proxy so the cookie stays confidential.
 - Treat configured provider headers as privileged: they are applied after authentication headers and can override them.
 
 ## Contributing

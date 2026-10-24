@@ -36,9 +36,17 @@ type requestInfoKey struct{}
 // outermost middleware owns the single "request completed" line, so failures
 // that never reach the relay are logged with the same shape as successes.
 type requestLog struct {
-	enabled bool
-	attrs   []any
-	usage   *ir.Usage
+	enabled       bool
+	attrs         []any
+	usage         *ir.Usage
+	requestID     string
+	user          string
+	model         string
+	provider      string
+	upstreamModel string
+	inbound       WireFormat
+	upstream      WireFormat
+	stream        bool
 }
 
 type requestLogKey struct{}
@@ -57,10 +65,13 @@ func logFrom(r *http.Request) *requestLog {
 
 // Server exposes the HTTP API.
 type Server struct {
-	cfg     *Config
-	router  routerAPI
-	logger  *slog.Logger
-	handler http.Handler
+	cfg       *Config
+	router    routerAPI
+	logger    *slog.Logger
+	handler   http.Handler
+	ui        *uiState
+	usersByID map[string]*User
+	startedAt time.Time
 }
 
 // NewServer wires the HTTP API. A nil logger uses slog.Default().
@@ -68,7 +79,18 @@ func NewServer(cfg *Config, router routerAPI, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	server := &Server{cfg: cfg, router: router, logger: logger}
+	usersByID := make(map[string]*User, len(cfg.UsersByKey))
+	for _, user := range cfg.UsersByKey {
+		usersByID[user.ID] = user
+	}
+	server := &Server{
+		cfg:       cfg,
+		router:    router,
+		logger:    logger,
+		ui:        newUIState(),
+		usersByID: usersByID,
+		startedAt: time.Now(),
+	}
 	server.handler = server.observe(server.withRequestInfo(server.routes()))
 	return server
 }
@@ -94,6 +116,7 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("POST "+spec.inbound, s.proxyHandler(spec))
 		mux.HandleFunc(spec.inbound, s.methodNotAllowed(http.MethodPost))
 	}
+	s.uiRoutes(mux)
 	mux.HandleFunc("/", s.handleNotFound)
 	return mux
 }
@@ -126,7 +149,9 @@ func (s *Server) withRequestInfo(next http.Handler) http.Handler {
 			id = "req_" + util.RandomHex(32)
 		}
 		w.Header().Set("x-request-id", id)
-		logFrom(r).add("request_id", id)
+		log := logFrom(r)
+		log.requestID = id
+		log.add("request_id", id)
 		ctx := context.WithValue(r.Context(), requestInfoKey{}, requestInfo{id: id, clientID: clientID})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -171,6 +196,9 @@ func (s *Server) observe(next http.Handler) http.Handler {
 				attrs = append(attrs, "usage", fmt.Sprintf(
 					"input_tokens=%d output_tokens=%d total_tokens=%d",
 					requestLog.usage.InputTokens, requestLog.usage.OutputTokens, requestLog.usage.TotalTokens()))
+			}
+			if requestLog.model != "" {
+				s.recordUIRequest(requestLog, started, status)
 			}
 			level := slog.LevelInfo
 			if status >= http.StatusInternalServerError {
@@ -219,6 +247,16 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":      "llm-proxy",
+		"version":   Version,
+		"models":    len(s.cfg.Models),
+		"endpoints": advertisedEndpoints(),
+		"ui":        uiRoot,
+	})
+}
+
+func advertisedEndpoints() map[string][]string {
 	endpoints := make(map[string][]string)
 	for _, spec := range routeSpecs {
 		if spec.advertise {
@@ -226,12 +264,32 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			endpoints[key] = append(endpoints[key], spec.inbound)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"name":      "llm-proxy",
-		"version":   Version,
-		"models":    len(s.cfg.Models),
-		"endpoints": endpoints,
-	})
+	return endpoints
+}
+
+// recordUIRequest feeds the in-memory dashboard window. Only model requests
+// reach this path, so health probes and the Web UI itself stay out of the
+// traffic statistics.
+func (s *Server) recordUIRequest(log *requestLog, started time.Time, status int) {
+	record := uiRequestRecord{
+		Time:          started.UTC(),
+		RequestID:     log.requestID,
+		User:          log.user,
+		Model:         log.model,
+		Provider:      log.provider,
+		UpstreamModel: log.upstreamModel,
+		Inbound:       string(log.inbound),
+		Upstream:      string(log.upstream),
+		Stream:        log.stream,
+		Status:        status,
+		DurationMS:    time.Since(started).Milliseconds(),
+	}
+	if log.usage != nil {
+		record.InputTokens = log.usage.PromptTokens()
+		record.OutputTokens = log.usage.OutputTokens
+		record.TotalTokens = log.usage.TotalTokens()
+	}
+	s.ui.recordRequest(record)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -256,6 +314,7 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, apiErr)
 		return
 	}
+	log.user = userID(user)
 	log.add("user", userID(user))
 
 	ids := make([]string, 0, len(s.cfg.Models))
@@ -282,6 +341,7 @@ func (s *Server) handleRetrieveModel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, apiErr)
 		return
 	}
+	log.user = userID(user)
 	log.add("user", userID(user))
 	model, apiErr := s.resolveModel(r.PathValue("model_id"), user)
 	if apiErr != nil {
