@@ -1,0 +1,22 @@
+# Build artefacts
+/bin/
+/llm-proxy
+*.test
+*.prof
+coverage.out
+
+# Local configuration and secrets are mounted at runtime instead
+config.toml
+config.local.toml
+.env
+.env.*
+
+# Tooling and VCS metadata
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+.trae/
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,41 @@
+# Example configuration. Copy to config.toml and replace the placeholder keys.
+# config.toml is git-ignored so local credentials are never committed.
+
+[general]
+drop_params = true
+
+[server]
+host = "0.0.0.0"
+port = 4000
+log_level = "info"
+
+[[providers]]
+id = "example-openai"
+protocol = "openai"
+base_url = "https://api.example.com/v1"
+key = "sk-replace-me"
+max_retries = 2
+endpoints = ["/chat/completions", "/responses"]
+
+[[providers]]
+id = "example-anthropic"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+key = "sk-ant-replace-me"
+max_retries = 2
+endpoints = ["/messages"]
+
+[[models]]
+id = "example/chat-model"
+context_length = 128000
+max_output_length = 16384
+modalities = ["text", "image"]
+providers = [
+    {provider_id = "example-openai", model = "chat-model", weight = 0.5},
+    {provider_id = "example-anthropic", model = "chat-model", weight = 0.5},
+]
+
+[[users]]
+id = "example-user"
+api_key = "sk-example-user"
+allowed_models = ["*"]

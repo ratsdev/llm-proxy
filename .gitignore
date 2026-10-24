@@ -1,0 +1,19 @@
+# Go build artefacts
+/bin/
+/llm-proxy
+*.test
+*.prof
+coverage.out
+
+# Local configuration with secrets
+config.toml
+config.local.toml
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.trae/
+.idea/
+.vscode/
+.DS_Store
