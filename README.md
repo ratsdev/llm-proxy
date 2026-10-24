@@ -80,12 +80,24 @@ The gateway listens on `0.0.0.0:4000` by default. Every API route lives under `/
 ### Docker
 
 ```bash
-docker build -t llm-proxy .
-
 docker run --rm -p 4000:4000 \
   -v "$PWD/config.toml:/etc/llm-proxy/config.toml:ro" \
-  llm-proxy
+  ghcr.io/ratsdev/llm-proxy:latest
 ```
+
+To build the image yourself instead, run `docker build -t llm-proxy .` and substitute `llm-proxy` for the image name above.
+
+Images are published to `ghcr.io/ratsdev/llm-proxy` and to Docker Hub as `docker.io/jqjiang/llm-proxy`; the two registries carry identical tags.
+
+| Tag | Meaning |
+| --- | --- |
+| `latest` | Most recently published build, including pre-releases. |
+| `stable` | Most recent stable release. Pre-release tags never move it. |
+| `1.2.3` | Exact release. |
+| `1.2` | Latest patch of that minor line. |
+| `1` | Latest release of that major line. |
+
+Use `stable` for production and pin an exact version when reproducibility matters; `latest` intentionally tracks the newest build and may include release candidates.
 
 The image runs as an unprivileged user (`10001:10001`) and reads its config from `/etc/llm-proxy/config.toml`. Mount the file read-only; never bake credentials into the image.
 
