@@ -29,7 +29,7 @@ func TestRunRejectsUnknownFlag(t *testing.T) {
 }
 
 func TestRunMissingConfigFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "missing.toml")
+	path := filepath.Join(t.TempDir(), "missing.yaml")
 	if code := run([]string{"-c", path}); code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
 	}

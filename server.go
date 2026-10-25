@@ -276,7 +276,9 @@ func (s *Server) recordUIRequest(log *requestLog, started time.Time, status int)
 		RequestID:     log.requestID,
 		User:          log.user,
 		Model:         log.model,
+		ModelName:     s.displayModelName(log.model),
 		Provider:      log.provider,
+		ProviderName:  s.displayProviderName(log.provider),
 		UpstreamModel: log.upstreamModel,
 		Inbound:       string(log.inbound),
 		Upstream:      string(log.upstream),
@@ -290,6 +292,20 @@ func (s *Server) recordUIRequest(log *requestLog, started time.Time, status int)
 		record.TotalTokens = log.usage.TotalTokens()
 	}
 	s.ui.recordRequest(record)
+}
+
+func (s *Server) displayModelName(id string) string {
+	if model, ok := s.cfg.Models[id]; ok && model.Name != "" {
+		return model.Name
+	}
+	return id
+}
+
+func (s *Server) displayProviderName(id string) string {
+	if provider, ok := s.cfg.Providers[id]; ok && provider.Name != "" {
+		return provider.Name
+	}
+	return id
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -354,11 +370,13 @@ func (s *Server) handleRetrieveModel(w http.ResponseWriter, r *http.Request) {
 
 func modelPayload(model *Model) map[string]any {
 	payload := map[string]any{
-		"id":         model.ID,
-		"object":     "model",
-		"created":    time.Now().Unix(),
-		"owned_by":   "llm-proxy",
-		"modalities": model.Modalities,
+		"id":                model.ID,
+		"name":              model.Name,
+		"object":            "model",
+		"created":           time.Now().Unix(),
+		"owned_by":          "llm-proxy",
+		"modalities":        model.Modalities,
+		"output_modalities": model.OutputModalities,
 	}
 	payload["context_length"] = nil
 	if model.ContextLength != nil {

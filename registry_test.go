@@ -1,6 +1,8 @@
 package llmproxy
 
-import "testing"
+import (
+	"testing"
+)
 
 // The adapter registry and the route table are two halves of the same
 // knowledge; a missing entry must fail here rather than panic in a request.
@@ -31,6 +33,7 @@ func TestRouteSpecsAreConsistent(t *testing.T) {
 
 	inbounds := make(map[string]bool)
 	endpoints := make(map[string]bool)
+	configKeys := make(map[string]bool)
 	for _, spec := range routeSpecs {
 		if inbounds[spec.inbound] {
 			t.Errorf("duplicate inbound path %q", spec.inbound)
@@ -38,17 +41,18 @@ func TestRouteSpecsAreConsistent(t *testing.T) {
 		if endpoints[spec.endpoint] {
 			t.Errorf("duplicate provider endpoint %q", spec.endpoint)
 		}
+		if configKeys[spec.configKey] {
+			t.Errorf("duplicate endpoint config key %q", spec.configKey)
+		}
 		inbounds[spec.inbound] = true
 		endpoints[spec.endpoint] = true
-		if !endpointAllowed(spec.protocol, spec.endpoint) {
-			t.Errorf("endpoint %q is not allowed for protocol %q", spec.endpoint, spec.protocol)
-		}
-		if _, ok := routeSpecForOperation(spec.endpoint, spec.operation); !ok {
-			t.Errorf("endpoint %q does not serve operation %q", spec.endpoint, spec.operation)
+		configKeys[spec.configKey] = true
+		if _, err := endpointPath(spec.endpoint, spec.configKey); err != nil {
+			t.Error(err)
 		}
 	}
 	for _, protocol := range supportedProtocols {
-		if defaultEndpoint(protocol) == "" {
+		if len(defaultRouteSpecs(protocol)) == 0 {
 			t.Errorf("protocol %q has no default endpoint", protocol)
 		}
 	}

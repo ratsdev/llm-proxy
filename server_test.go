@@ -20,12 +20,10 @@ import (
 type fakeRouter struct {
 	mu sync.Mutex
 
-	send func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error)
-	raw  func(model *Model, operation string, payload map[string]any, stickyID string) (*RouteResult, error)
+	send func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error)
 
 	lastStickyID     string
 	lastProtocol     WireFormat
-	lastOperation    string
 	lastInboundHeads map[string]string
 	lastPayload      map[string]any
 }
@@ -33,22 +31,15 @@ type fakeRouter struct {
 func (f *fakeRouter) Send(_ context.Context, request RouteRequest) (*RouteResult, error) {
 	f.mu.Lock()
 	f.lastStickyID = request.StickyID
-	f.lastOperation = request.Operation
 	f.lastInboundHeads = request.InboundHeaders
 	f.lastProtocol = request.PreferredFormat
 	f.lastPayload = request.Payload
 	f.mu.Unlock()
 
-	if !request.ChatFamily {
-		if f.raw == nil {
-			return staticResult(request.Model, http.StatusOK, `{"data":[]}`), nil
-		}
-		return f.raw(request.Model, request.Operation, request.Payload, request.StickyID)
-	}
 	if f.send == nil {
 		return staticResult(request.Model, http.StatusOK, `{"ok":true}`), nil
 	}
-	return f.send(request.Model, request.Operation, request.Request, request.StickyID, string(request.PreferredFormat))
+	return f.send(request.Model, request.Request, request.StickyID, string(request.PreferredFormat))
 }
 
 func staticResult(model *Model, status int, body string) *RouteResult {
@@ -84,8 +75,7 @@ func newTestServer(t *testing.T, router routerAPI, mutate func(*Config)) *httpte
 	t.Helper()
 	cfg := &Config{
 		Providers: map[string]*Provider{
-			"provider": {ID: "provider", BaseURL: "http://upstream", Protocol: ProtocolOpenAI,
-				MaxRetries: 0, Endpoints: []string{"/chat/completions"}, Headers: map[string]string{}},
+			"provider": testProvider("provider", "http://upstream", ProtocolOpenAI, "/chat/completions"),
 		},
 		Models: map[string]*Model{
 			"model/a": {ID: "model/a", Modalities: []string{"text"},
@@ -317,7 +307,7 @@ func TestServerPreservesClientRequestID(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return errorResult(model, http.StatusTooManyRequests, `{"error":{"message":"slow down","type":"rate_limit_error"}}`), nil
 		},
 	}
@@ -362,7 +352,7 @@ func TestServerAnthropicErrorEnvelope(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return errorResult(model, http.StatusNotFound, `{"error":{"message":"missing","type":"not_found_error"}}`), nil
 		},
 	}
@@ -393,7 +383,7 @@ func TestServerChatRewritesModelAndSetsHeaders(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			// The upstream replies with the upstream model name and an id.
 			return staticResult(model, http.StatusOK, `{
 				"id":"chatcmpl-up","model":"model-a","created":7,
@@ -431,10 +421,9 @@ func TestServerChatRewritesModelAndSetsHeaders(t *testing.T) {
 
 	router.mu.Lock()
 	protocol := router.lastProtocol
-	operation := router.lastOperation
 	router.mu.Unlock()
-	if protocol != wireOpenAI || operation != "chat" {
-		t.Fatalf("dispatch = %q/%q", protocol, operation)
+	if protocol != wireOpenAI {
+		t.Fatalf("dispatch protocol = %q", protocol)
 	}
 }
 
@@ -442,7 +431,7 @@ func TestServerUpstreamInvalidJSON(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return staticResult(model, http.StatusOK, `[1,2,3]`), nil
 		},
 	}
@@ -458,37 +447,11 @@ func TestServerUpstreamInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestServerEmbeddingsPassthrough(t *testing.T) {
-	t.Parallel()
-
-	var captured map[string]any
-	router := &fakeRouter{
-		raw: func(model *Model, operation string, payload map[string]any, stickyID string) (*RouteResult, error) {
-			captured = payload
-			return staticResult(model, http.StatusOK, `{"object":"list","data":[]}`), nil
-		},
-	}
-	server := newTestServer(t, router, nil)
-
-	response := doJSON(t, http.MethodPost, server.URL+"/api/v1/embeddings", "key-a",
-		`{"model":"model/a","input":"hello"}`)
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", response.StatusCode)
-	}
-	body := decodeBody(t, response)
-	if body["object"] != "list" {
-		t.Fatalf("body = %v", body)
-	}
-	if captured["input"] != "hello" {
-		t.Fatalf("payload = %v", captured)
-	}
-}
-
 func TestServerStreamInterruptionEmitsError(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			body := &failingStream{
 				chunks: []string{
 					`data: {"id":"up","model":"m","choices":[{"delta":{"content":"hi"}}]}` + "\n\n",
@@ -541,7 +504,7 @@ func TestServerUpstreamStreamErrorIsTerminal(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return &RouteResult{
 				ProviderID:    "provider",
 				UpstreamModel: "model-a",
@@ -575,7 +538,7 @@ func TestServerAnthropicStreamInterruptionStopsAfterError(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return &RouteResult{
 				ProviderID:    "provider",
 				UpstreamModel: "model-a",
@@ -615,7 +578,7 @@ func TestServerStreamConversionAnthropic(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return &RouteResult{
 				ProviderID:    "provider",
 				UpstreamModel: "model-a",
@@ -722,7 +685,7 @@ func TestServerRecoversFromPanic(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			panic("boom")
 		},
 	}
@@ -779,32 +742,6 @@ func (s *failingStream) Read(p []byte) (int, error) {
 
 func (s *failingStream) Close() error { return nil }
 
-func TestServerStreamsRawBytes(t *testing.T) {
-	t.Parallel()
-
-	payload := `{"object":"list","data":[{"embedding":[0.1]}]}`
-	router := &fakeRouter{
-		raw: func(model *Model, operation string, body map[string]any, stickyID string) (*RouteResult, error) {
-			return &RouteResult{
-				ProviderID:    "provider",
-				UpstreamModel: "model-a",
-				WireFormat:    "openai",
-				Status:        http.StatusOK,
-				Header:        http.Header{},
-				Body:          io.NopCloser(bytes.NewReader([]byte(payload))),
-			}, nil
-		},
-	}
-	server := newTestServer(t, router, nil)
-
-	response := doJSON(t, http.MethodPost, server.URL+"/api/v1/embeddings", "key-a",
-		`{"model":"model/a","input":"hi","stream":true}`)
-	data, _ := io.ReadAll(response.Body)
-	if string(data) != payload {
-		t.Fatalf("raw passthrough = %q", data)
-	}
-}
-
 func TestServerMethodNotAllowedUsesJSONEnvelope(t *testing.T) {
 	t.Parallel()
 
@@ -827,7 +764,7 @@ func TestServerConvertedJSONErrorObject(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return staticResult(model, http.StatusOK,
 				`{"error":{"message":"boom","type":"server_error"}}`), nil
 		},
@@ -879,25 +816,22 @@ func TestRelayPlan(t *testing.T) {
 
 	cases := []struct {
 		name         string
-		chatFamily   bool
 		stream       bool
 		sameWire     bool
 		upstreamJSON bool
 		want         relayMode
 	}{
-		{"raw", false, false, true, false, relayRaw},
-		{"raw stream", false, true, false, false, relayRaw},
-		{"passthrough json", true, false, true, false, relayPassthroughJSON},
-		{"convert json", true, false, false, false, relayConvertJSON},
-		{"passthrough sse", true, true, true, false, relayPassthroughSSE},
-		{"convert sse", true, true, false, false, relayConvertSSE},
-		{"buffered sse", true, true, false, true, relayBufferedSSE},
+		{"passthrough json", false, true, false, relayPassthroughJSON},
+		{"convert json", false, false, false, relayConvertJSON},
+		{"passthrough sse", true, true, false, relayPassthroughSSE},
+		{"convert sse", true, false, false, relayConvertSSE},
+		{"buffered sse", true, false, true, relayBufferedSSE},
 	}
 	for _, test := range cases {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if got := planMode(test.chatFamily, test.stream, test.sameWire, test.upstreamJSON); got != test.want {
+			if got := planMode(test.stream, test.sameWire, test.upstreamJSON); got != test.want {
 				t.Fatalf("planMode = %v, want %v", got, test.want)
 			}
 		})

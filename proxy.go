@@ -52,13 +52,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, spec routeS
 	log.add("user", userID(user), "model", modelID)
 
 	inbound := adapterFor(spec.wire)
-	chatFamily := spec.chatFamily()
 	stream, includeUsage := inboundStreamFlags(spec.wire, payload)
 	routeRequest := RouteRequest{
 		Model:           model,
-		Operation:       spec.operation,
 		Stream:          stream,
-		ChatFamily:      chatFamily,
 		InboundHeaders:  inboundHeaders(r),
 		StickyID:        requestInfoFrom(r).clientID,
 		PreferredFormat: spec.wire,
@@ -100,7 +97,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, spec routeS
 		"client_protocol", spec.wire)
 
 	relay := &relaySpec{
-		mode:         planMode(chatFamily, routeRequest.Stream, result.WireFormat == spec.wire, isJSONResponse(result)),
+		mode:         planMode(routeRequest.Stream, result.WireFormat == spec.wire, isJSONResponse(result)),
 		modelID:      modelID,
 		inbound:      inbound,
 		upstream:     adapterFor(result.WireFormat),
@@ -114,8 +111,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, spec routeS
 type relayMode int
 
 const (
-	relayRaw relayMode = iota
-	relayPassthroughJSON
+	relayPassthroughJSON relayMode = iota
 	relayConvertJSON
 	relayPassthroughSSE
 	relayConvertSSE
@@ -124,10 +120,8 @@ const (
 
 // planMode decides the write path. Mode selection is pure so it can be tested
 // on its own.
-func planMode(chatFamily, stream, sameWire, upstreamJSON bool) relayMode {
+func planMode(stream, sameWire, upstreamJSON bool) relayMode {
 	switch {
-	case !chatFamily:
-		return relayRaw
 	case stream && upstreamJSON:
 		// The upstream ignored "stream" and answered with a normal body.
 		return relayBufferedSSE
@@ -161,8 +155,6 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, result *RouteResu
 	}()
 
 	switch spec.mode {
-	case relayRaw:
-		s.relayRaw(w, r, result)
 	case relayPassthroughJSON:
 		s.relayPassthroughJSON(w, r, result, spec)
 	case relayConvertJSON:
@@ -175,33 +167,6 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, result *RouteResu
 		s.relayConvertSSE(w, r, result, spec)
 	case relayBufferedSSE:
 		s.relayBufferedSSE(w, r, result, spec)
-	}
-}
-
-func (s *Server) relayRaw(w http.ResponseWriter, r *http.Request, result *RouteResult) {
-	contentType := result.Header.Get("content-type")
-	if contentType == "" {
-		contentType = "application/json"
-	}
-	w.Header().Set("content-type", contentType)
-	w.WriteHeader(result.Status)
-	flush(w)
-
-	buffer := make([]byte, 32<<10)
-	for {
-		n, err := result.Body.Read(buffer)
-		if n > 0 {
-			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-				return
-			}
-			flush(w)
-		}
-		if err != nil {
-			if !errors.Is(err, io.EOF) && r.Context().Err() == nil {
-				s.logger.Warn("raw stream interrupted", "error", err)
-			}
-			return
-		}
 	}
 }
 

@@ -330,7 +330,7 @@ func TestUIHidesSecrets(t *testing.T) {
 	server := newTestServer(t, &fakeRouter{}, func(cfg *Config) {
 		cfg.Providers["provider"].Key = "super-secret-provider-key"
 		cfg.Providers["provider"].Headers = map[string]string{"x-secret": "header-secret-value"}
-		cfg.Providers["provider"].BaseURL = "http://user:pass@upstream.internal/v1?token=query-secret"
+		cfg.Providers["provider"].BaseURLs[ProtocolOpenAI] = "http://user:pass@upstream.internal/v1?token=query-secret"
 	})
 	client := uiLogin(t, server, "key-a")
 
@@ -406,11 +406,60 @@ func TestUIRequestHistoryIsPerUser(t *testing.T) {
 	}
 }
 
+func TestUIDisplaysNamesInsteadOfIDs(t *testing.T) {
+	t.Parallel()
+
+	server := newTestServer(t, &fakeRouter{}, func(cfg *Config) {
+		cfg.Providers["provider"].Name = "Upstream Provider"
+		cfg.Models["model/a"].Name = "Model A"
+		cfg.UsersByKey["key-a"].Name = "Alice"
+	})
+
+	response := doJSON(t, http.MethodPost, server.URL+"/api/v1/chat/completions", "key-a",
+		`{"model":"model/a","messages":[{"role":"user","content":"hi"}]}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("request status = %d", response.StatusCode)
+	}
+
+	client := uiLogin(t, server, "key-a")
+
+	session := uiDecode(t, uiCall(t, client, http.MethodGet, server.URL+"/api/ui/session", "", nil))
+	user := session["user"].(map[string]any)
+	userModelNames, _ := user["allowed_model_names"].(map[string]any)
+	if user["name"] != "Alice" || userModelNames["model/a"] != "Model A" {
+		t.Fatalf("session user = %v", user)
+	}
+
+	models := uiDecode(t, uiCall(t, client, http.MethodGet, server.URL+"/api/ui/models", "", nil))["models"].([]any)
+	model := models[0].(map[string]any)
+	if model["name"] != "Model A" {
+		t.Fatalf("model name = %v", model)
+	}
+	binding := model["providers"].([]any)[0].(map[string]any)
+	if binding["name"] != "Upstream Provider" {
+		t.Fatalf("binding name = %v", binding)
+	}
+
+	providers := uiDecode(t, uiCall(t, client, http.MethodGet, server.URL+"/api/ui/providers", "", nil))["providers"].([]any)
+	provider := providers[0].(map[string]any)
+	providerModelNames, _ := provider["model_names"].(map[string]any)
+	if provider["name"] != "Upstream Provider" || providerModelNames["model/a"] != "Model A" {
+		t.Fatalf("provider = %v", provider)
+	}
+
+	records := uiDecode(t, uiCall(t, client, http.MethodGet, server.URL+"/api/ui/requests", "", nil))["records"].([]any)
+	record := records[0].(map[string]any)
+	if record["model"] != "model/a" || record["model_name"] != "Model A" ||
+		record["provider"] != "provider" || record["provider_name"] != "Upstream Provider" {
+		t.Fatalf("record = %v", record)
+	}
+}
+
 func TestUIUsageFromPassthroughJSON(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return &RouteResult{
 				ProviderID:    "provider",
 				UpstreamModel: "model-a",

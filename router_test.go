@@ -18,14 +18,34 @@ import (
 )
 
 func testProvider(id, baseURL string, protocol ProviderProtocol, endpoints ...string) *Provider {
+	configured := make([]ProviderEndpoint, 0, len(endpoints))
+	for _, path := range endpoints {
+		spec, ok := testRouteSpec(path)
+		if !ok {
+			panic("testProvider: unknown endpoint " + path)
+		}
+		configured = append(configured, ProviderEndpoint{
+			Name: spec.configKey,
+			Path: spec.endpoint,
+			Wire: spec.wire,
+		})
+	}
 	return &Provider{
 		ID:         id,
-		BaseURL:    baseURL,
-		Protocol:   protocol,
+		BaseURLs:   map[ProviderProtocol]string{protocol: baseURL},
 		MaxRetries: 2,
-		Endpoints:  endpoints,
+		Endpoints:  map[ProviderProtocol][]ProviderEndpoint{protocol: configured},
 		Headers:    map[string]string{},
 	}
+}
+
+func testRouteSpec(path string) (routeSpec, bool) {
+	for _, spec := range routeSpecs {
+		if spec.endpoint == path {
+			return spec, true
+		}
+	}
+	return routeSpec{}, false
 }
 
 func testConfig(providers []*Provider, model *Model) *Config {
@@ -54,11 +74,10 @@ func textRequest(text string) *ir.Request {
 func noSleep(context.Context, time.Duration) error { return nil }
 
 // send is a test helper for the RouteRequest-based router API.
-func send(router *Router, ctx context.Context, model *Model, operation string, request *ir.Request,
+func send(router *Router, ctx context.Context, model *Model, request *ir.Request,
 	headers map[string]string, stickyID string, inbound WireFormat) (*RouteResult, error) {
 	return router.Send(ctx, RouteRequest{
 		Model:           model,
-		Operation:       operation,
 		Stream:          request != nil && request.Stream,
 		InboundHeaders:  headers,
 		StickyID:        stickyID,
@@ -94,7 +113,7 @@ func TestRouterPrefersInboundEndpoint(t *testing.T) {
 		{"anthropic", "/chat/completions"},
 	}
 	for _, test := range cases {
-		result, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "", test.inbound)
+		result, err := send(router, t.Context(), model, textRequest("hi"), nil, "", test.inbound)
 		if err != nil {
 			t.Fatalf("%s send: %v", test.inbound, err)
 		}
@@ -119,7 +138,7 @@ func TestRouterFallsBackWhenEndpointMissing(t *testing.T) {
 	router, _ := NewRouter(testConfig([]*Provider{provider}, model), WithSleep(noSleep))
 	defer router.Close()
 
-	result, err := send(router, t.Context(), model, "responses", textRequest("hi"), nil, "", "responses")
+	result, err := send(router, t.Context(), model, textRequest("hi"), nil, "", "responses")
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -145,7 +164,7 @@ func TestRouterWeightedStart(t *testing.T) {
 	high, _ := NewRouter(testConfig([]*Provider{p1, p2}, model), WithRand(func() float64 { return 0.999 }), WithSleep(noSleep))
 	defer high.Close()
 
-	result, err := send(low, t.Context(), model, "chat", textRequest("hi"), nil, "", "openai")
+	result, err := send(low, t.Context(), model, textRequest("hi"), nil, "", "openai")
 	if err != nil {
 		t.Fatalf("low send: %v", err)
 	}
@@ -154,7 +173,7 @@ func TestRouterWeightedStart(t *testing.T) {
 	}
 	_ = result.Close()
 
-	result, err = send(high, t.Context(), model, "chat", textRequest("hi"), nil, "", "openai")
+	result, err = send(high, t.Context(), model, textRequest("hi"), nil, "", "openai")
 	if err != nil {
 		t.Fatalf("high send: %v", err)
 	}
@@ -183,7 +202,7 @@ func TestRouterNetworkFailover(t *testing.T) {
 	router, _ := NewRouter(testConfig([]*Provider{p1, p2}, model), WithRand(func() float64 { return 0 }), WithSleep(noSleep))
 	defer router.Close()
 
-	result, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "", "openai")
+	result, err := send(router, t.Context(), model, textRequest("hi"), nil, "", "openai")
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -219,7 +238,7 @@ func TestRouterStickyRouting(t *testing.T) {
 	router, _ := NewRouter(testConfig([]*Provider{p1, p2}, model), WithRand(source), WithSleep(noSleep))
 	defer router.Close()
 
-	first, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "req-1", "openai")
+	first, err := send(router, t.Context(), model, textRequest("hi"), nil, "req-1", "openai")
 	if err != nil {
 		t.Fatalf("first send: %v", err)
 	}
@@ -229,7 +248,7 @@ func TestRouterStickyRouting(t *testing.T) {
 	callsAfterFirst := randomCalls
 	mu.Unlock()
 
-	second, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "req-1", "openai")
+	second, err := send(router, t.Context(), model, textRequest("hi"), nil, "req-1", "openai")
 	if err != nil {
 		t.Fatalf("second send: %v", err)
 	}
@@ -265,7 +284,7 @@ func TestRouterRepinsAfterFailover(t *testing.T) {
 	router, _ := NewRouter(testConfig([]*Provider{p1, p2}, model), WithRand(func() float64 { return 0 }), WithSleep(noSleep))
 	defer router.Close()
 
-	result, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "req-1", "openai")
+	result, err := send(router, t.Context(), model, textRequest("hi"), nil, "req-1", "openai")
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -300,7 +319,7 @@ func TestRouterDoesNotRetryClientErrors(t *testing.T) {
 	router, _ := NewRouter(testConfig([]*Provider{p1, p2}, model), WithRand(func() float64 { return 0 }), WithSleep(noSleep))
 	defer router.Close()
 
-	result, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "", "openai")
+	result, err := send(router, t.Context(), model, textRequest("hi"), nil, "", "openai")
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -345,7 +364,7 @@ func TestRouterRetriesAndRecordsRetryAfter(t *testing.T) {
 		}))
 	defer router.Close()
 
-	result, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "", "openai")
+	result, err := send(router, t.Context(), model, textRequest("hi"), nil, "", "openai")
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -375,7 +394,7 @@ func TestRouterReturnsLastRetryableError(t *testing.T) {
 	router, _ := NewRouter(testConfig([]*Provider{p}, model), WithSleep(noSleep))
 	defer router.Close()
 
-	result, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "", "openai")
+	result, err := send(router, t.Context(), model, textRequest("hi"), nil, "", "openai")
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -399,7 +418,7 @@ func TestRouterAllProvidersFail(t *testing.T) {
 	router, _ := NewRouter(testConfig([]*Provider{p}, model), WithSleep(noSleep))
 	defer router.Close()
 
-	_, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "", "openai")
+	_, err := send(router, t.Context(), model, textRequest("hi"), nil, "", "openai")
 	var gatewayError *util.Error
 	if !errors.As(err, &gatewayError) || gatewayError.Status != http.StatusBadGateway {
 		t.Fatalf("err = %v", err)
@@ -421,7 +440,7 @@ func TestRouterVideoOnlyUsesOpenAIProviders(t *testing.T) {
 
 	openAIProvider := testProvider("p1", deadURL, ProtocolOpenAI, "/chat/completions")
 	openAIProvider.MaxRetries = 0
-	anthropicProvider := testProvider("p2", anthropicServer.URL, ProtocolAnthropic, "/messages")
+	anthropicProvider := testProvider("p2", anthropicServer.URL, ProtocolAnthropic, "/v1/messages")
 	model := &Model{ID: "m", Providers: []ModelProvider{
 		{ProviderID: "p1", UpstreamModel: "u1", Weight: 1},
 		{ProviderID: "p2", UpstreamModel: "u2", Weight: 1},
@@ -438,7 +457,7 @@ func TestRouterVideoOnlyUsesOpenAIProviders(t *testing.T) {
 			{Type: ir.Video, VideoURL: "https://video"},
 		},
 	}}}
-	_, err := send(router, t.Context(), model, "chat", request, nil, "", "openai")
+	_, err := send(router, t.Context(), model, request, nil, "", "openai")
 	if err == nil {
 		t.Fatal("expected failure when the only OpenAI provider is down")
 	}
@@ -448,7 +467,7 @@ func TestRouterVideoOnlyUsesOpenAIProviders(t *testing.T) {
 
 	// Without a video block the Anthropic provider is eligible again.
 	plain := textRequest("hi")
-	result, err := send(router, t.Context(), model, "chat", plain, nil, "", "openai")
+	result, err := send(router, t.Context(), model, plain, nil, "", "openai")
 	if err != nil {
 		t.Fatalf("plain send: %v", err)
 	}
@@ -472,8 +491,8 @@ func TestRouterRawPayloadDropsParamsAndRewritesModel(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":[]}`))
 	})
 
-	provider := testProvider("p", server.URL, ProtocolOpenAI, "/embeddings")
-	model := &Model{ID: "m", Providers: []ModelProvider{{ProviderID: "p", UpstreamModel: "upstream-embed", Weight: 1}}}
+	provider := testProvider("p", server.URL, ProtocolOpenAI, "/chat/completions")
+	model := &Model{ID: "m", Providers: []ModelProvider{{ProviderID: "p", UpstreamModel: "upstream-chat", Weight: 1}}}
 	cfg := testConfig([]*Provider{provider}, model)
 	cfg.DropParams = true
 
@@ -482,23 +501,23 @@ func TestRouterRawPayloadDropsParamsAndRewritesModel(t *testing.T) {
 
 	payload := map[string]any{
 		"model":     "public",
-		"input":     "hello",
+		"messages":  []any{map[string]any{"role": "user", "content": "hello"}},
 		"stream":    false,
 		"litellm_x": 1,
 		"_internal": true,
 		"nothing":   nil,
 	}
 	result, err := router.Send(t.Context(), RouteRequest{
-		Model:     model,
-		Operation: "embeddings",
-		Payload:   payload,
+		Model:           model,
+		PreferredFormat: wireOpenAI,
+		Payload:         payload,
 	})
 	if err != nil {
 		t.Fatalf("send raw: %v", err)
 	}
 	defer result.Close()
 
-	if captured["model"] != "upstream-embed" {
+	if captured["model"] != "upstream-chat" {
 		t.Fatalf("model = %v", captured["model"])
 	}
 	for _, key := range []string{"litellm_x", "_internal", "nothing"} {
@@ -506,8 +525,8 @@ func TestRouterRawPayloadDropsParamsAndRewritesModel(t *testing.T) {
 			t.Fatalf("dropped key %q forwarded: %v", key, captured)
 		}
 	}
-	if captured["input"] != "hello" {
-		t.Fatalf("input = %v", captured["input"])
+	if _, ok := captured["messages"]; !ok {
+		t.Fatalf("messages dropped: %v", captured)
 	}
 }
 
@@ -532,8 +551,6 @@ func TestRouterSameWireForwardsPayloadFields(t *testing.T) {
 
 	result, err := router.Send(t.Context(), RouteRequest{
 		Model:           model,
-		Operation:       "chat",
-		ChatFamily:      true,
 		PreferredFormat: wireOpenAI,
 		Payload: map[string]any{
 			"model":    "public",
@@ -572,15 +589,13 @@ func TestRouterCrossWireConvertsPayload(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[]}`))
 	})
 
-	provider := testProvider("p", server.URL, ProtocolAnthropic, "/messages")
+	provider := testProvider("p", server.URL, ProtocolAnthropic, "/v1/messages")
 	model := &Model{ID: "m", Providers: []ModelProvider{{ProviderID: "p", UpstreamModel: "claude", Weight: 1}}}
 	router, _ := NewRouter(testConfig([]*Provider{provider}, model), WithSleep(noSleep))
 	defer router.Close()
 
 	result, err := router.Send(t.Context(), RouteRequest{
 		Model:           model,
-		Operation:       "chat",
-		ChatFamily:      true,
 		PreferredFormat: wireOpenAI,
 		Payload: map[string]any{
 			"model":    "public",
@@ -630,8 +645,6 @@ func TestRouterAppliesModelMaxOutputToChatUpstream(t *testing.T) {
 
 	result, err := router.Send(t.Context(), RouteRequest{
 		Model:           model,
-		Operation:       "chat",
-		ChatFamily:      true,
 		PreferredFormat: wireResponses,
 		Payload: map[string]any{
 			"model": "public",
@@ -667,7 +680,7 @@ func TestRouterContextCancellationStopsRetries(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := send(router, ctx, model, "chat", textRequest("hi"), nil, "", "openai")
+	_, err := send(router, ctx, model, textRequest("hi"), nil, "", "openai")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v", err)
 	}
@@ -719,7 +732,7 @@ func TestRouterConcurrentSticky(t *testing.T) {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
-			result, err := send(router, t.Context(), model, "chat", textRequest("hi"),
+			result, err := send(router, t.Context(), model, textRequest("hi"),
 				nil, fmt.Sprintf("req-%d", index%4), "openai")
 			if err != nil {
 				t.Errorf("send: %v", err)
@@ -744,7 +757,7 @@ func TestRouterUpstreamHeaders(t *testing.T) {
 	openAI.Key = "sk-test"
 	openAI.Headers = map[string]string{"x-extra": "1", "Authorization": "Custom token"}
 
-	anthropicProvider := testProvider("anthropic", server.URL, ProtocolAnthropic, "/messages")
+	anthropicProvider := testProvider("anthropic", server.URL, ProtocolAnthropic, "/v1/messages")
 	anthropicProvider.Key = "ak-test"
 
 	modelFor := func(providerID string) *Model {
@@ -754,7 +767,7 @@ func TestRouterUpstreamHeaders(t *testing.T) {
 	openAIModel := modelFor("openai")
 	openAIRouter, _ := NewRouter(testConfig([]*Provider{openAI}, openAIModel), WithSleep(noSleep))
 	defer openAIRouter.Close()
-	result, err := send(openAIRouter, t.Context(), openAIModel, "chat", textRequest("hi"), nil, "", "openai")
+	result, err := send(openAIRouter, t.Context(), openAIModel, textRequest("hi"), nil, "", "openai")
 	if err != nil {
 		t.Fatalf("openai send: %v", err)
 	}
@@ -777,7 +790,7 @@ func TestRouterUpstreamHeaders(t *testing.T) {
 	anthropicModel := modelFor("anthropic")
 	anthropicRouter, _ := NewRouter(testConfig([]*Provider{anthropicProvider}, anthropicModel), WithSleep(noSleep))
 	defer anthropicRouter.Close()
-	result, err = send(anthropicRouter, t.Context(), anthropicModel, "chat", textRequest("hi"),
+	result, err = send(anthropicRouter, t.Context(), anthropicModel, textRequest("hi"),
 		map[string]string{"anthropic-version": "2024-01-01", "anthropic-beta": "beta-1"}, "", "openai")
 	if err != nil {
 		t.Fatalf("anthropic send: %v", err)
@@ -796,7 +809,7 @@ func TestRouterUpstreamHeaders(t *testing.T) {
 	}
 
 	// A stream request advertises SSE.
-	result, err = send(anthropicRouter, t.Context(), anthropicModel, "chat",
+	result, err = send(anthropicRouter, t.Context(), anthropicModel,
 		&ir.Request{Stream: true, Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.Block{ir.TextBlock("hi")}}}},
 		nil, "", "openai")
 	if err != nil {
@@ -845,7 +858,6 @@ func TestRouterPreservesPrepareClientError(t *testing.T) {
 
 	_, err = router.dispatch(t.Context(), RouteRequest{
 		Model:           model,
-		Operation:       "chat",
 		PreferredFormat: wireOpenAI,
 	}, func(candidate) (map[string]any, error) {
 		return nil, util.New(400, "invalid body", "", "invalid_body", nil)

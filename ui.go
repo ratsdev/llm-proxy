@@ -104,7 +104,9 @@ type uiRequestRecord struct {
 	RequestID     string    `json:"request_id"`
 	User          string    `json:"user"`
 	Model         string    `json:"model"`
+	ModelName     string    `json:"model_name"`
 	Provider      string    `json:"provider"`
+	ProviderName  string    `json:"provider_name"`
 	UpstreamModel string    `json:"upstream_model"`
 	Inbound       string    `json:"inbound"`
 	Upstream      string    `json:"upstream"`
@@ -330,7 +332,7 @@ func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 	log.add("user", user.ID)
 	s.setUISessionCookie(w, r, token, expires)
 	writeUIJSON(w, http.StatusOK, map[string]any{
-		"user":       userPayload(user),
+		"user":       s.userPayload(user),
 		"expires_at": expires.UTC(),
 		"gateway":    uiGatewayPayload(),
 	})
@@ -351,7 +353,7 @@ func (s *Server) handleUISession(w http.ResponseWriter, r *http.Request) {
 	}
 	writeUIJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
-		"user":          userPayload(user),
+		"user":          s.userPayload(user),
 		"expires_at":    expires.UTC(),
 		"gateway":       uiGatewayPayload(),
 	})
@@ -533,20 +535,25 @@ func (s *Server) uiModelPayload(model *Model) map[string]any {
 	bindings := make([]map[string]any, 0, len(model.Providers))
 	for _, binding := range model.Providers {
 		provider, ok := s.cfg.Providers[binding.ProviderID]
-		protocol := ""
+		protocols := []ProviderProtocol(nil)
+		name := ""
 		if ok {
-			protocol = string(provider.Protocol)
+			protocols = provider.Protocols()
+			name = provider.Name
 		}
 		bindings = append(bindings, map[string]any{
 			"id":             binding.ProviderID,
-			"protocol":       protocol,
+			"name":           name,
+			"protocols":      protocols,
 			"upstream_model": binding.UpstreamModel,
 			"weight":         binding.Weight,
 		})
 	}
 	return map[string]any{
 		"id":                model.ID,
+		"name":              model.Name,
 		"modalities":        model.Modalities,
+		"output_modalities": model.OutputModalities,
 		"providers":         bindings,
 		"context_length":    nullable(model.ContextLength),
 		"max_output_length": nullable(model.MaxOutputLength),
@@ -562,7 +569,7 @@ func nullable[T any](value *T) any {
 	return *value
 }
 
-func uiProviderPayload(provider *Provider, models []string) map[string]any {
+func uiProviderPayload(provider *Provider, models []*Model) map[string]any {
 	proxyScheme := ""
 	if provider.Proxy != "" {
 		if parsed, err := url.Parse(provider.Proxy); err == nil {
@@ -573,19 +580,40 @@ func uiProviderPayload(provider *Provider, models []string) map[string]any {
 	if provider.Timeout != nil {
 		timeout = *provider.Timeout
 	}
-	sort.Strings(models)
+	modelIDs := make([]string, 0, len(models))
+	modelNames := make(map[string]string, len(models))
+	for _, model := range models {
+		modelIDs = append(modelIDs, model.ID)
+		if model.Name != "" {
+			modelNames[model.ID] = model.Name
+		}
+	}
+	sort.Strings(modelIDs)
+	protocols := provider.Protocols()
+	baseURLs := make(map[string]string, len(protocols))
+	endpoints := make(map[string]map[string]string, len(protocols))
+	for _, protocol := range protocols {
+		baseURLs[string(protocol)] = displayBaseURL(provider.BaseURLs[protocol])
+		byName := make(map[string]string, len(provider.Endpoints[protocol]))
+		for _, endpoint := range provider.Endpoints[protocol] {
+			byName[endpoint.Name] = endpoint.Path
+		}
+		endpoints[string(protocol)] = byName
+	}
 	return map[string]any{
 		"id":             provider.ID,
-		"protocol":       string(provider.Protocol),
-		"base_url":       displayBaseURL(provider.BaseURL),
-		"endpoints":      provider.Endpoints,
+		"name":           provider.Name,
+		"protocols":      protocols,
+		"base_urls":      baseURLs,
+		"endpoints":      endpoints,
 		"max_retries":    provider.MaxRetries,
 		"timeout":        timeout,
 		"has_key":        provider.Key != "",
 		"proxy":          provider.Proxy != "",
 		"proxy_scheme":   proxyScheme,
 		"custom_headers": len(provider.Headers) > 0,
-		"models":         models,
+		"models":         modelIDs,
+		"model_names":    modelNames,
 	}
 }
 
@@ -604,15 +632,15 @@ func displayBaseURL(raw string) string {
 }
 
 // providerIndex groups the visible models by provider in one pass. It returns
-// the provider IDs in sorted order plus the model IDs bound to each provider.
-func providerIndex(cfg *Config, models []*Model) ([]string, map[string][]string) {
-	modelsByProvider := make(map[string][]string)
+// the provider IDs in sorted order plus the models bound to each provider.
+func providerIndex(cfg *Config, models []*Model) ([]string, map[string][]*Model) {
+	modelsByProvider := make(map[string][]*Model)
 	for _, model := range models {
 		for _, binding := range model.Providers {
 			if _, ok := cfg.Providers[binding.ProviderID]; !ok {
 				continue
 			}
-			modelsByProvider[binding.ProviderID] = append(modelsByProvider[binding.ProviderID], model.ID)
+			modelsByProvider[binding.ProviderID] = append(modelsByProvider[binding.ProviderID], model)
 		}
 	}
 	ids := make([]string, 0, len(modelsByProvider))
@@ -655,8 +683,8 @@ func summarizeUI(records []uiRequestRecord, now time.Time) (uiSummary, []uiBucke
 			}
 		}
 
-		addBreakdown(modelStats, record.Model, record)
-		addBreakdown(providerStats, record.Provider, record)
+		addBreakdown(modelStats, record.Model, record.ModelName, "No model", record)
+		addBreakdown(providerStats, record.Provider, record.ProviderName, "No provider", record)
 	}
 
 	summary.Success = summary.Requests - summary.Errors
@@ -667,14 +695,20 @@ func summarizeUI(records []uiRequestRecord, now time.Time) (uiSummary, []uiBucke
 	return summary, buckets, sortedBreakdowns(modelStats), sortedBreakdowns(providerStats)
 }
 
-func addBreakdown(stats map[string]*uiBreakdown, name string, record uiRequestRecord) {
-	if name == "" {
-		name = "No provider"
+// addBreakdown aggregates by canonical ID while labeling the group with the
+// human-readable name, so two entries that share a name stay separate. An empty
+// ID falls back to emptyLabel so the row is still identifiable.
+func addBreakdown(stats map[string]*uiBreakdown, id, name, emptyLabel string, record uiRequestRecord) {
+	if id == "" {
+		id = emptyLabel
 	}
-	entry, ok := stats[name]
+	if name == "" {
+		name = id
+	}
+	entry, ok := stats[id]
 	if !ok {
 		entry = &uiBreakdown{Name: name}
-		stats[name] = entry
+		stats[id] = entry
 	}
 	entry.Requests++
 	entry.TotalTokens += record.TotalTokens
@@ -708,7 +742,7 @@ func uiGatewayPayload() map[string]any {
 	}
 }
 
-func userPayload(user *User) map[string]any {
+func (s *Server) userPayload(user *User) map[string]any {
 	unrestricted := user.AllowedModels == nil
 	for _, allowed := range user.AllowedModels {
 		if allowed == "*" {
@@ -719,10 +753,18 @@ func userPayload(user *User) map[string]any {
 	if allowed == nil {
 		allowed = []string{}
 	}
+	modelNames := make(map[string]string, len(allowed))
+	for _, id := range allowed {
+		if model, ok := s.cfg.Models[id]; ok && model.Name != "" {
+			modelNames[id] = model.Name
+		}
+	}
 	return map[string]any{
-		"id":             user.ID,
-		"allowed_models": allowed,
-		"unrestricted":   unrestricted,
+		"id":                  user.ID,
+		"name":                user.Name,
+		"allowed_models":      allowed,
+		"allowed_model_names": modelNames,
+		"unrestricted":        unrestricted,
 	}
 }
 

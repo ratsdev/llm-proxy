@@ -1,18 +1,21 @@
 package llmproxy
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/url"
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
-	"github.com/BurntSushi/toml"
-
-	"github.com/ratsdev/llm-proxy/util"
+	"gopkg.in/yaml.v3"
 )
 
 // maxProviderRetries bounds the retry loop so a configuration typo cannot turn
@@ -28,48 +31,77 @@ var proxySchemes = map[string]bool{
 	"http": true, "https": true, "socks5": true, "socks5h": true,
 }
 
-// Provider is one upstream endpoint group.
+// Provider is one upstream service. A single provider may expose an OpenAI
+// base URL, an Anthropic base URL, or both, and each protocol has its own
+// endpoint table.
 type Provider struct {
 	ID         string
-	BaseURL    string
-	Protocol   ProviderProtocol
+	Name       string
+	BaseURLs   map[ProviderProtocol]string
 	Key        string
 	MaxRetries int
 	Timeout    *float64
-	Endpoints  []string
+	Endpoints  map[ProviderProtocol][]ProviderEndpoint
 	Headers    map[string]string
 	Proxy      string
 }
 
-// URLFor joins the base URL with an endpoint path.
-func (p *Provider) URLFor(endpoint string) string {
-	return p.BaseURL + endpoint
+// ProviderEndpoint is one configured upstream endpoint. Name is the
+// configuration key ("chat_completions", "responses", "messages", ...), while
+// Path is the path appended to the protocol's base URL.
+type ProviderEndpoint struct {
+	Name string
+	Path string
+	Wire WireFormat
 }
 
-// OutboundFor picks the declared endpoint to use for an operation.
+// Protocols returns the configured protocols in their canonical order.
+func (p *Provider) Protocols() []ProviderProtocol {
+	protocols := make([]ProviderProtocol, 0, len(p.BaseURLs))
+	for _, protocol := range supportedProtocols {
+		if _, ok := p.BaseURLs[protocol]; ok {
+			protocols = append(protocols, protocol)
+		}
+	}
+	return protocols
+}
+
+// HasProtocol reports whether the provider has a base URL for the protocol.
+func (p *Provider) HasProtocol(protocol ProviderProtocol) bool {
+	_, ok := p.BaseURLs[protocol]
+	return ok
+}
+
+// URLFor joins a protocol's base URL with an endpoint path.
+func (p *Provider) URLFor(protocol ProviderProtocol, endpoint string) string {
+	return p.BaseURLs[protocol] + endpoint
+}
+
+// OutboundFor picks the configured endpoint to use for a request.
 //
 // Providers are selected by weight irrespective of their endpoints. Once a
 // provider is chosen, its endpoint is matched to the inbound wire format when
-// possible, falling back to the first declared chat-family endpoint.
-func (p *Provider) OutboundFor(operation string, preferred WireFormat) (endpoint string, wire WireFormat, ok bool) {
-	var fallback routeSpec
-	fallbackEndpoint := ""
-	for _, candidate := range p.Endpoints {
-		spec, exists := routeSpecForOperation(candidate, operation)
-		if !exists {
+// possible, falling back to the first compatible endpoint. When protocols are
+// supplied, only endpoints from those protocols are considered; the router
+// uses that to keep video requests on OpenAI-compatible endpoints.
+func (p *Provider) OutboundFor(preferred WireFormat, protocols ...ProviderProtocol) (ProviderEndpoint, ProviderProtocol, bool) {
+	var fallback ProviderEndpoint
+	var fallbackProtocol ProviderProtocol
+	hasFallback := false
+	for _, protocol := range p.Protocols() {
+		if len(protocols) > 0 && !slices.Contains(protocols, protocol) {
 			continue
 		}
-		if spec.wire == preferred {
-			return candidate, spec.wire, true
-		}
-		if fallbackEndpoint == "" {
-			fallback, fallbackEndpoint = spec, candidate
+		for _, candidate := range p.Endpoints[protocol] {
+			if candidate.Wire == preferred {
+				return candidate, protocol, true
+			}
+			if !hasFallback {
+				fallback, fallbackProtocol, hasFallback = candidate, protocol, true
+			}
 		}
 	}
-	if fallbackEndpoint == "" {
-		return "", "", false
-	}
-	return fallbackEndpoint, fallback.wire, true
+	return fallback, fallbackProtocol, hasFallback
 }
 
 // ModelProvider binds a model to one provider's upstream model name.
@@ -81,17 +113,20 @@ type ModelProvider struct {
 
 // Model is a caller-visible model with its upstream providers.
 type Model struct {
-	ID              string
-	Providers       []ModelProvider
-	ContextLength   *int
-	MaxOutputLength *int
-	Modalities      []string
-	Timeout         *float64
+	ID               string
+	Name             string
+	Providers        []ModelProvider
+	ContextLength    *int
+	MaxOutputLength  *int
+	Modalities       []string
+	OutputModalities []string
+	Timeout          *float64
 }
 
 // User is an API-key holder with an optional model allow-list.
 type User struct {
 	ID            string
+	Name          string
 	APIKey        string
 	AllowedModels []string
 }
@@ -134,52 +169,62 @@ type Overrides struct {
 }
 
 type fileConfig struct {
-	General   fileGeneral    `toml:"general"`
-	Server    fileServer     `toml:"server"`
-	Providers []fileProvider `toml:"providers"`
-	Models    []fileModel    `toml:"models"`
-	Users     []fileUser     `toml:"users"`
+	General   fileGeneral             `yaml:"general"`
+	Server    fileServer              `yaml:"server"`
+	Providers map[string]fileProvider `yaml:"providers"`
+	Models    map[string]fileModel    `yaml:"models"`
+	Users     map[string]fileUser     `yaml:"users"`
 }
 
 type fileGeneral struct {
-	DropParams bool   `toml:"drop_params"`
-	LogLevel   string `toml:"log_level"`
+	DropParams bool   `yaml:"drop_params"`
+	LogLevel   string `yaml:"log_level"`
 }
 
 type fileServer struct {
-	Host     string `toml:"host"`
-	Port     *int   `toml:"port"`
-	LogLevel string `toml:"log_level"`
+	Host     string `yaml:"host"`
+	Port     *int   `yaml:"port"`
+	LogLevel string `yaml:"log_level"`
 }
 
 type fileProvider struct {
-	ID         string            `toml:"id"`
-	BaseURL    string            `toml:"base_url"`
-	Protocol   string            `toml:"protocol"`
-	Key        string            `toml:"key"`
-	MaxRetries *int              `toml:"max_retries"`
-	Timeout    *float64          `toml:"timeout"`
-	Endpoints  []string          `toml:"endpoints"`
-	Headers    map[string]string `toml:"headers"`
-	Proxy      string            `toml:"proxy"`
+	Name       string                        `yaml:"name"`
+	BaseURLs   map[string]string             `yaml:"base_url"`
+	APIKey     string                        `yaml:"api_key"`
+	MaxRetries *int                          `yaml:"max_retries"`
+	Timeout    *float64                      `yaml:"timeout"`
+	Endpoints  map[string]map[string]*string `yaml:"endpoints"`
+	Headers    map[string]string             `yaml:"headers"`
+	Proxy      string                        `yaml:"proxy"`
 }
 
 type fileModel struct {
-	ID              string           `toml:"id"`
-	Providers       []map[string]any `toml:"providers"`
-	ContextLength   *int             `toml:"context_length"`
-	MaxOutputLength *int             `toml:"max_output_length"`
-	Modalities      []string         `toml:"modalities"`
-	Timeout         *float64         `toml:"timeout"`
+	Name            string              `yaml:"name"`
+	Providers       []fileModelProvider `yaml:"providers"`
+	ContextLength   *int                `yaml:"context_length"`
+	MaxOutputLength *int                `yaml:"max_output_length"`
+	Modalities      *fileModalities     `yaml:"modalities"`
+	Timeout         *float64            `yaml:"timeout"`
+}
+
+type fileModalities struct {
+	Input  []string `yaml:"input"`
+	Output []string `yaml:"output"`
+}
+
+type fileModelProvider struct {
+	ProviderID string   `yaml:"provider_id"`
+	ModelID    string   `yaml:"model_id"`
+	Weight     *float64 `yaml:"weight"`
 }
 
 type fileUser struct {
-	ID            string   `toml:"id"`
-	APIKey        string   `toml:"api_key"`
-	AllowedModels []string `toml:"allowed_models"`
+	Name          string   `yaml:"name"`
+	APIKey        string   `yaml:"api_key"`
+	AllowedModels []string `yaml:"allowed_models"`
 }
 
-// LoadConfig reads and validates a TOML configuration file.
+// LoadConfig reads and validates a YAML configuration file.
 func LoadConfig(path string) (*Config, error) {
 	return LoadConfigWith(path, Overrides{})
 }
@@ -195,18 +240,29 @@ func LoadConfigWith(path string, overrides Overrides) (*Config, error) {
 		return nil, fmt.Errorf("cannot read config file %s: %w", path, err)
 	}
 
-	var file fileConfig
-	meta, err := toml.Decode(string(data), &file)
-	if err != nil {
-		return nil, fmt.Errorf("invalid TOML in %s: %w", path, decodeConfigError(err))
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, fmt.Errorf("config file %s is empty", path)
 	}
-	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
-		keys := make([]string, 0, len(undecoded))
-		for _, key := range undecoded {
-			keys = append(keys, key.String())
+
+	var file fileConfig
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&file); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("config file %s is empty", path)
 		}
-		sort.Strings(keys)
-		return nil, fmt.Errorf("unknown configuration keys in %s: %s", path, strings.Join(keys, ", "))
+		if keys := unknownConfigKeys(err); len(keys) > 0 {
+			return nil, fmt.Errorf("unknown configuration keys in %s: %s", path, strings.Join(keys, ", "))
+		}
+		return nil, fmt.Errorf("invalid YAML in %s: %w", path, decodeConfigError(err, data))
+	}
+	var extra yaml.Node
+	switch err := decoder.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+	case err != nil:
+		return nil, fmt.Errorf("invalid YAML in %s: %w", path, decodeConfigError(err, data))
+	default:
+		return nil, fmt.Errorf("config file %s must contain a single YAML document", path)
 	}
 	cfg, err := file.build()
 	if err != nil {
@@ -227,20 +283,100 @@ func LoadConfigWith(path string, overrides Overrides) (*Config, error) {
 	return cfg, nil
 }
 
-func decodeConfigError(err error) error {
-	text := err.Error()
-	switch {
-	case strings.Contains(text, "max_retries"):
-		return fmt.Errorf("max_retries must be an integer between 0 and %d", maxProviderRetries)
-	case strings.Contains(text, "timeout"):
-		return fmt.Errorf("timeout must be a positive number")
-	case strings.Contains(text, "drop_params"):
-		return fmt.Errorf("general.drop_params must be a boolean")
-	case strings.Contains(text, "port"):
-		return fmt.Errorf("server.port must be an integer between 1 and 65535")
-	default:
+// unknownConfigKeys extracts the offending keys from a yaml.v3 KnownFields
+// error, sorted and deduplicated so the message is stable.
+func unknownConfigKeys(err error) []string {
+	var typeErr *yaml.TypeError
+	if !errors.As(err, &typeErr) {
+		return nil
+	}
+	keys := make([]string, 0, len(typeErr.Errors))
+	for _, entry := range typeErr.Errors {
+		if !strings.Contains(entry, "not found in type") {
+			continue
+		}
+		const marker = "field "
+		index := strings.Index(entry, marker)
+		if index < 0 {
+			continue
+		}
+		rest := entry[index+len(marker):]
+		end := strings.IndexByte(rest, ' ')
+		if end <= 0 {
+			continue
+		}
+		keys = append(keys, rest[:end])
+	}
+	sort.Strings(keys)
+	return slices.Compact(keys)
+}
+
+// decodeConfigError turns YAML type errors into messages that name the
+// offending configuration field. yaml.v3 reports a source line rather than the
+// struct field, so yamlErrorField looks that line up in the original document.
+func decodeConfigError(err error, data []byte) error {
+	var typeErr *yaml.TypeError
+	if !errors.As(err, &typeErr) {
 		return err
 	}
+	for _, entry := range typeErr.Errors {
+		switch yamlErrorField(entry, data) {
+		case "max_retries":
+			return fmt.Errorf("max_retries must be an integer between 0 and %d", maxProviderRetries)
+		case "timeout":
+			return fmt.Errorf("timeout must be a positive number")
+		case "drop_params":
+			return fmt.Errorf("general.drop_params must be a boolean")
+		case "port":
+			return fmt.Errorf("server.port must be an integer between 1 and 65535")
+		}
+	}
+	return err
+}
+
+// yamlErrorField resolves the configuration key on the source line a yaml.v3
+// TypeError points at. Block scalar values sit below their key, so the search
+// walks up until it finds a line that contains one.
+func yamlErrorField(entry string, data []byte) string {
+	number := yamlErrorLine(entry)
+	lines := strings.Split(string(data), "\n")
+	if number < 1 || number > len(lines) {
+		return ""
+	}
+	for index := number - 1; index >= 0; index-- {
+		source := strings.TrimSpace(lines[index])
+		if source == "" || strings.HasPrefix(source, "#") {
+			continue
+		}
+		source = strings.TrimPrefix(source, "- ")
+		colon := strings.Index(source, ":")
+		if colon < 0 {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(source[:colon]), `"'`)
+	}
+	return ""
+}
+
+func yamlErrorLine(entry string) int {
+	const marker = "line "
+	index := strings.Index(entry, marker)
+	if index < 0 {
+		return 0
+	}
+	rest := entry[index+len(marker):]
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	number, err := strconv.Atoi(rest[:end])
+	if err != nil {
+		return 0
+	}
+	return number
 }
 
 func (f fileConfig) build() (*Config, error) {
@@ -264,25 +400,19 @@ func (f fileConfig) build() (*Config, error) {
 	}
 
 	providers := make(map[string]*Provider)
-	for index, item := range f.Providers {
-		provider, err := item.build(index)
+	for _, id := range sortedMapKeys(f.Providers) {
+		provider, err := f.Providers[id].build(id)
 		if err != nil {
 			return nil, err
-		}
-		if _, exists := providers[provider.ID]; exists {
-			return nil, fmt.Errorf("duplicate provider id %q", provider.ID)
 		}
 		providers[provider.ID] = provider
 	}
 
 	models := make(map[string]*Model)
-	for index, item := range f.Models {
-		model, err := item.build(index)
+	for _, id := range sortedMapKeys(f.Models) {
+		model, err := f.Models[id].build(id)
 		if err != nil {
 			return nil, err
-		}
-		if _, exists := models[model.ID]; exists {
-			return nil, fmt.Errorf("duplicate model id %q", model.ID)
 		}
 		for _, modelProvider := range model.Providers {
 			if _, exists := providers[modelProvider.ProviderID]; !exists {
@@ -293,16 +423,11 @@ func (f fileConfig) build() (*Config, error) {
 	}
 
 	usersByKey := make(map[string]*User)
-	userIDs := make(map[string]bool)
-	for index, item := range f.Users {
-		user, err := item.build(index)
+	for _, id := range sortedMapKeys(f.Users) {
+		user, err := f.Users[id].build(id)
 		if err != nil {
 			return nil, err
 		}
-		if userIDs[user.ID] {
-			return nil, fmt.Errorf("duplicate user id %q", user.ID)
-		}
-		userIDs[user.ID] = true
 		if _, exists := usersByKey[user.APIKey]; exists {
 			return nil, fmt.Errorf("duplicate api_key for user %q", user.ID)
 		}
@@ -328,34 +453,16 @@ func (f fileConfig) build() (*Config, error) {
 	}, nil
 }
 
-func (f fileProvider) build(index int) (*Provider, error) {
-	where := fmt.Sprintf("providers[%d]", index)
-
-	id := strings.TrimSpace(f.ID)
-	if id == "" {
-		return nil, fmt.Errorf("%s.id must be a non-empty string", where)
-	}
-	baseURL := strings.TrimSpace(f.BaseURL)
-	if baseURL == "" {
-		return nil, fmt.Errorf("%s.base_url must be a non-empty string", where)
-	}
-	parsedBase, err := url.Parse(baseURL)
+func (f fileProvider) build(id string) (*Provider, error) {
+	id, err := configID("provider", id)
 	if err != nil {
-		return nil, fmt.Errorf("%s.base_url must be an http(s) URL, got %q", where, baseURL)
+		return nil, err
 	}
-	if parsedBase.Host == "" || (parsedBase.Scheme != "http" && parsedBase.Scheme != "https") {
-		return nil, fmt.Errorf("%s.base_url must be an http(s) URL, got %q", where, baseURL)
-	}
-	baseURL = strings.TrimRight(baseURL, "/")
+	where := fmt.Sprintf("providers.%s", id)
 
-	protocol := ProtocolOpenAI
-	if f.Protocol != "" {
-		candidate := ProviderProtocol(f.Protocol)
-		if !slices.Contains(supportedProtocols, candidate) {
-			return nil, fmt.Errorf("%s.protocol %v is not supported (expected one of: %s)",
-				where, f.Protocol, protocolList())
-		}
-		protocol = candidate
+	baseURLs, err := normalizeBaseURLs(f.BaseURLs, where)
+	if err != nil {
+		return nil, err
 	}
 
 	maxRetries := 2
@@ -370,7 +477,7 @@ func (f fileProvider) build(index int) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	endpoints, err := normalizeEndpoints(f.Endpoints, where, protocol)
+	endpoints, err := normalizeProviderEndpoints(f.Endpoints, baseURLs, where)
 	if err != nil {
 		return nil, err
 	}
@@ -383,12 +490,15 @@ func (f fileProvider) build(index int) (*Provider, error) {
 	if headers == nil {
 		headers = map[string]string{}
 	}
+	if err := validateHeaders(headers, where); err != nil {
+		return nil, err
+	}
 
 	return &Provider{
 		ID:         id,
-		BaseURL:    baseURL,
-		Protocol:   protocol,
-		Key:        f.Key,
+		Name:       strings.TrimSpace(f.Name),
+		BaseURLs:   baseURLs,
+		Key:        strings.TrimSpace(f.APIKey),
 		MaxRetries: maxRetries,
 		Timeout:    timeout,
 		Endpoints:  endpoints,
@@ -397,13 +507,13 @@ func (f fileProvider) build(index int) (*Provider, error) {
 	}, nil
 }
 
-func (f fileModel) build(index int) (*Model, error) {
-	where := fmt.Sprintf("models[%d]", index)
-
-	id := strings.TrimSpace(f.ID)
-	if id == "" {
-		return nil, fmt.Errorf("%s.id must be a non-empty string", where)
+func (f fileModel) build(id string) (*Model, error) {
+	id, err := configID("model", id)
+	if err != nil {
+		return nil, err
 	}
+	where := fmt.Sprintf("models.%s", id)
+
 	if len(f.Providers) == 0 {
 		return nil, fmt.Errorf("%s.providers must be a non-empty array", where)
 	}
@@ -412,7 +522,7 @@ func (f fileModel) build(index int) (*Model, error) {
 	declared := 0
 	for refIndex, raw := range f.Providers {
 		providerWhere := fmt.Sprintf("%s.providers[%d]", where, refIndex)
-		modelProvider, hasWeight, err := parseModelProvider(raw, providerWhere)
+		modelProvider, hasWeight, err := raw.build(providerWhere)
 		if err != nil {
 			return nil, err
 		}
@@ -445,97 +555,46 @@ func (f fileModel) build(index int) (*Model, error) {
 		return nil, err
 	}
 
-	modalities := f.Modalities
-	if modalities == nil {
-		modalities = []string{"text"}
+	modalities := []string{"text"}
+	outputModalities := []string{"text"}
+	if f.Modalities != nil {
+		if len(f.Modalities.Input) > 0 {
+			modalities = append([]string(nil), f.Modalities.Input...)
+		}
+		if len(f.Modalities.Output) > 0 {
+			outputModalities = append([]string(nil), f.Modalities.Output...)
+		}
 	}
 
 	return &Model{
-		ID:              id,
-		Providers:       providers,
-		ContextLength:   f.ContextLength,
-		MaxOutputLength: f.MaxOutputLength,
-		Modalities:      modalities,
-		Timeout:         timeout,
+		ID:               id,
+		Name:             strings.TrimSpace(f.Name),
+		Providers:        providers,
+		ContextLength:    f.ContextLength,
+		MaxOutputLength:  f.MaxOutputLength,
+		Modalities:       modalities,
+		OutputModalities: outputModalities,
+		Timeout:          timeout,
 	}, nil
 }
 
-func (f fileUser) build(index int) (*User, error) {
-	where := fmt.Sprintf("users[%d]", index)
-
-	id := strings.TrimSpace(f.ID)
-	if id == "" {
-		return nil, fmt.Errorf("%s.id must be a non-empty string", where)
+func (f fileModelProvider) build(where string) (ModelProvider, bool, error) {
+	providerID := strings.TrimSpace(f.ProviderID)
+	if providerID == "" {
+		return ModelProvider{}, false, fmt.Errorf("%s.provider_id must be a non-empty string", where)
 	}
-	apiKey := strings.TrimSpace(f.APIKey)
-	if apiKey == "" {
-		return nil, fmt.Errorf("%s.api_key must be a non-empty string", where)
-	}
-	return &User{ID: id, APIKey: apiKey, AllowedModels: f.AllowedModels}, nil
-}
-
-func normalizeEndpoints(items []string, where string, protocol ProviderProtocol) ([]string, error) {
-	if items == nil {
-		return []string{defaultEndpoint(protocol)}, nil
-	}
-	if len(items) == 0 {
-		return nil, fmt.Errorf("%s.endpoints must be a non-empty array of strings", where)
-	}
-
-	seen := make(map[string]bool)
-	endpoints := make([]string, 0, len(items))
-	for _, item := range items {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			return nil, fmt.Errorf("%s.endpoints must contain non-empty strings", where)
-		}
-		if !strings.HasPrefix(item, "/") {
-			item = "/" + item
-		}
-		if !endpointAllowed(protocol, item) {
-			return nil, fmt.Errorf("%s.endpoints contains unsupported endpoint %q for protocol %q",
-				where, item, protocol)
-		}
-		if !seen[item] {
-			seen[item] = true
-			endpoints = append(endpoints, item)
-		}
-	}
-	return endpoints, nil
-}
-
-var modelProviderKeys = []string{"model", "provider_id", "weight"}
-
-func parseModelProvider(raw map[string]any, where string) (ModelProvider, bool, error) {
-	unknown := make([]string, 0)
-	for key := range raw {
-		if !slices.Contains(modelProviderKeys, key) {
-			unknown = append(unknown, key)
-		}
-	}
-	if len(unknown) > 0 {
-		sort.Strings(unknown)
-		return ModelProvider{}, false, fmt.Errorf("%s has unknown keys: %s (expected: %s)",
-			where, strings.Join(unknown, ", "), strings.Join(modelProviderKeys, ", "))
-	}
-
-	providerID, err := requireString(raw, "provider_id", where)
-	if err != nil {
-		return ModelProvider{}, false, err
-	}
-	upstreamModel, err := requireString(raw, "model", where)
-	if err != nil {
-		return ModelProvider{}, false, err
+	upstreamModel := strings.TrimSpace(f.ModelID)
+	if upstreamModel == "" {
+		return ModelProvider{}, false, fmt.Errorf("%s.model_id must be a non-empty string", where)
 	}
 
 	weight := 1.0
-	value, hasWeight := raw["weight"]
+	hasWeight := f.Weight != nil
 	if hasWeight {
-		number, valid := util.AsFloat(value)
-		if !valid || number <= 0 {
+		if !isFinite(*f.Weight) || *f.Weight <= 0 {
 			return ModelProvider{}, false, fmt.Errorf("%s.weight must be a positive number", where)
 		}
-		weight = number
+		weight = *f.Weight
 	}
 	return ModelProvider{
 		ProviderID:    providerID,
@@ -544,16 +603,182 @@ func parseModelProvider(raw map[string]any, where string) (ModelProvider, bool, 
 	}, hasWeight, nil
 }
 
-func requireString(raw map[string]any, key, where string) (string, error) {
-	value, ok := raw[key]
-	if !ok {
-		return "", fmt.Errorf("%s.%s must be a non-empty string", where, key)
+func (f fileUser) build(id string) (*User, error) {
+	id, err := configID("user", id)
+	if err != nil {
+		return nil, err
 	}
-	text, ok := value.(string)
-	if !ok || strings.TrimSpace(text) == "" {
-		return "", fmt.Errorf("%s.%s must be a non-empty string", where, key)
+	where := fmt.Sprintf("users.%s", id)
+	apiKey := strings.TrimSpace(f.APIKey)
+	if apiKey == "" {
+		return nil, fmt.Errorf("%s.api_key must be a non-empty string", where)
 	}
-	return strings.TrimSpace(text), nil
+	return &User{ID: id, Name: strings.TrimSpace(f.Name), APIKey: apiKey, AllowedModels: f.AllowedModels}, nil
+}
+
+func normalizeBaseURLs(raw map[string]string, where string) (map[ProviderProtocol]string, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("%s.base_url must declare at least one protocol (%s)", where, protocolList())
+	}
+	baseURLs := make(map[ProviderProtocol]string, len(raw))
+	for _, key := range sortedMapKeys(raw) {
+		protocol, err := protocolKey(key, where+".base_url")
+		if err != nil {
+			return nil, err
+		}
+		baseURL := strings.TrimSpace(raw[key])
+		if baseURL == "" {
+			return nil, fmt.Errorf("%s.base_url.%s must be a non-empty string", where, protocol)
+		}
+		parsed, err := url.Parse(baseURL)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return nil, fmt.Errorf("%s.base_url.%s must be an http(s) URL, got %q", where, protocol, baseURL)
+		}
+		baseURLs[protocol] = strings.TrimRight(baseURL, "/")
+	}
+	return baseURLs, nil
+}
+
+// normalizeProviderEndpoints turns the configuration's endpoint table into the
+// provider's immutable endpoint list.
+//
+// Every configured protocol starts with its default endpoints. Declaring
+// endpoints overrides that protocol's list with an allow-list: only the listed
+// endpoints are enabled, and a missing or empty path uses the default path.
+// Protocols left out of the endpoints table keep every default endpoint.
+func normalizeProviderEndpoints(raw map[string]map[string]*string, baseURLs map[ProviderProtocol]string, where string) (map[ProviderProtocol][]ProviderEndpoint, error) {
+	endpoints := make(map[ProviderProtocol][]ProviderEndpoint, len(baseURLs))
+	for _, protocol := range supportedProtocols {
+		if _, exists := baseURLs[protocol]; exists {
+			endpoints[protocol] = defaultProviderEndpoints(protocol)
+		}
+	}
+	if raw == nil {
+		return endpoints, nil
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("%s.endpoints must declare at least one endpoint (omit the field to enable every default endpoint)", where)
+	}
+
+	for _, key := range sortedMapKeys(raw) {
+		protocol, err := protocolKey(key, where+".endpoints")
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := baseURLs[protocol]; !exists {
+			return nil, fmt.Errorf("%s.endpoints.%s requires base_url.%s", where, protocol, protocol)
+		}
+		entries := raw[key]
+		if len(entries) == 0 {
+			return nil, fmt.Errorf("%s.endpoints.%s must be a non-empty mapping (omit endpoints to enable every default endpoint)",
+				where, protocol)
+		}
+
+		for _, name := range sortedMapKeys(entries) {
+			if name != strings.TrimSpace(name) {
+				return nil, fmt.Errorf("%s.endpoints.%s %q must not have leading or trailing whitespace",
+					where, protocol, name)
+			}
+			spec, ok := routeSpecForConfigKey(name)
+			if !ok {
+				return nil, fmt.Errorf("%s.endpoints.%s.%s is not a supported endpoint (expected one of: %s)",
+					where, protocol, name, endpointList(protocol))
+			}
+			if spec.protocol != protocol {
+				return nil, fmt.Errorf("%s.endpoints.%s.%s is only supported for protocol %q",
+					where, protocol, name, spec.protocol)
+			}
+		}
+
+		built := make([]ProviderEndpoint, 0, len(entries))
+		for _, spec := range routeSpecsForProtocol(protocol) {
+			value, ok := entries[spec.configKey]
+			if !ok {
+				continue
+			}
+			path := spec.endpoint
+			if value != nil {
+				if trimmed := strings.TrimSpace(*value); trimmed != "" {
+					path, err = endpointPath(trimmed, fmt.Sprintf("%s.endpoints.%s.%s", where, protocol, spec.configKey))
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+			built = append(built, endpointFromSpec(spec, path))
+		}
+		endpoints[protocol] = built
+	}
+	return endpoints, nil
+}
+
+func defaultProviderEndpoints(protocol ProviderProtocol) []ProviderEndpoint {
+	specs := defaultRouteSpecs(protocol)
+	endpoints := make([]ProviderEndpoint, 0, len(specs))
+	for _, spec := range specs {
+		endpoints = append(endpoints, endpointFromSpec(spec, spec.endpoint))
+	}
+	return endpoints
+}
+
+func endpointFromSpec(spec routeSpec, path string) ProviderEndpoint {
+	return ProviderEndpoint{
+		Name: spec.configKey,
+		Path: path,
+		Wire: spec.wire,
+	}
+}
+
+// endpointPath validates a configured upstream path. Paths are appended to the
+// protocol's base URL verbatim, so a full URL, query string, fragment, or
+// whitespace would silently change the target instead of failing at startup.
+func endpointPath(path, where string) (string, error) {
+	if !strings.HasPrefix(path, "/") {
+		return "", fmt.Errorf("%s must be a path starting with \"/\", got %q", where, path)
+	}
+	if strings.ContainsFunc(path, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
+		return "", fmt.Errorf("%s must not contain whitespace or control characters, got %q", where, path)
+	}
+	parsed, err := url.Parse(path)
+	if err != nil || parsed.Scheme != "" || parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("%s must be a URL path without a scheme, host, query, or fragment, got %q", where, path)
+	}
+	return path, nil
+}
+
+// configID validates a map key used as an entity ID. YAML keeps leading and
+// trailing whitespace inside quoted keys, so reject those keys instead of
+// trimming them into silent duplicates.
+func configID(kind, id string) (string, error) {
+	if strings.TrimSpace(id) == "" {
+		return "", fmt.Errorf("%s ids must be non-empty strings", kind)
+	}
+	if id != strings.TrimSpace(id) {
+		return "", fmt.Errorf("%s id %q must not have leading or trailing whitespace", kind, id)
+	}
+	return id, nil
+}
+
+// protocolKey validates a base_url or endpoints key. YAML keeps whitespace in
+// quoted keys, so reject it rather than trimming it into a duplicate.
+func protocolKey(key, where string) (ProviderProtocol, error) {
+	if key != strings.TrimSpace(key) {
+		return "", fmt.Errorf("%s %q must not have leading or trailing whitespace", where, key)
+	}
+	protocol := ProviderProtocol(key)
+	if !slices.Contains(supportedProtocols, protocol) {
+		return "", fmt.Errorf("%s %q is not supported (expected one of: %s)", where, key, protocolList())
+	}
+	return protocol, nil
+}
+
+func endpointList(protocol ProviderProtocol) string {
+	specs := routeSpecsForProtocol(protocol)
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.configKey)
+	}
+	return strings.Join(names, ", ")
 }
 
 func validateTimeout(value *float64, where string) (*float64, error) {
@@ -591,6 +816,39 @@ func validateProxy(text, where string) (string, error) {
 	return text, nil
 }
 
+// invalidHeaderToken reports characters that cannot appear in an HTTP header
+// name. Go's transport rejects these only when sending, which would surface as
+// an upstream failure instead of a configuration error.
+func invalidHeaderToken(r rune) bool {
+	return unicode.IsSpace(r) || unicode.IsControl(r) || strings.ContainsRune("()<>@,;:\\\"/[]?={}", r)
+}
+
+// validateHeaders rejects header names and values that Go's transport would
+// refuse at request time, so a typo fails at startup instead.
+func validateHeaders(headers map[string]string, where string) error {
+	for _, name := range sortedMapKeys(headers) {
+		value := headers[name]
+		if name == "" || name != strings.TrimSpace(name) || strings.ContainsFunc(name, invalidHeaderToken) {
+			return fmt.Errorf("%s.headers %q is not a valid header name", where, name)
+		}
+		if strings.ContainsFunc(value, func(r rune) bool {
+			return r != '\t' && unicode.IsControl(r)
+		}) {
+			return fmt.Errorf("%s.headers %q must not contain control characters", where, name)
+		}
+	}
+	return nil
+}
+
 func isFinite(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func sortedMapKeys[V any](items map[string]V) []string {
+	keys := make([]string, 0, len(items))
+	for key := range items {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }

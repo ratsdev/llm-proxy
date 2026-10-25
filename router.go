@@ -81,6 +81,7 @@ func (r *RouteResult) Close() error {
 type candidate struct {
 	provider      *Provider
 	modelProvider ModelProvider
+	protocol      ProviderProtocol
 	wireFormat    WireFormat
 	endpoint      string
 }
@@ -90,15 +91,13 @@ type stickyEntry struct {
 	upstreamModel string
 }
 
-// RouteRequest is one dispatch. Payload is the inbound JSON. ChatFamily marks
-// routes that may be translated when the upstream wire differs; same-wire
-// candidates forward Payload after sanitizing the model name. Request is an
-// optional pre-parsed IR (tests and lazy conversion).
+// RouteRequest is one dispatch. Payload is the inbound JSON. Same-wire
+// candidates forward Payload after sanitizing the model name; other candidates
+// are translated through the IR. Request is an optional pre-parsed IR (tests
+// and lazy conversion).
 type RouteRequest struct {
 	Model           *Model
-	Operation       string
 	Stream          bool
-	ChatFamily      bool
 	InboundHeaders  map[string]string
 	StickyID        string
 	PreferredFormat WireFormat
@@ -218,7 +217,7 @@ func (r *Router) Send(ctx context.Context, req RouteRequest) (*RouteResult, erro
 	}
 
 	prepare := func(target candidate) (map[string]any, error) {
-		if req.Payload != nil && (!req.ChatFamily || target.wireFormat == req.PreferredFormat) {
+		if req.Payload != nil && target.wireFormat == req.PreferredFormat {
 			body := sanitizePayload(req.Payload, r.cfg.DropParams)
 			body["model"] = target.modelProvider.UpstreamModel
 			return body, nil
@@ -237,7 +236,7 @@ func (r *Router) detectVideo(req RouteRequest, ensure func() (*ir.Request, error
 	if req.Request != nil {
 		return ir.HasVideo(req.Request), nil
 	}
-	if !req.ChatFamily || req.Payload == nil || !r.hasNonOpenAI(req.Model) {
+	if req.Payload == nil || !r.hasNonOpenAI(req.Model) {
 		return false, nil
 	}
 	request, err := ensure()
@@ -253,35 +252,37 @@ func (r *Router) hasNonOpenAI(model *Model) bool {
 	}
 	for _, modelProvider := range model.Providers {
 		provider, ok := r.cfg.Providers[modelProvider.ProviderID]
-		if ok && provider.Protocol != ProtocolOpenAI {
+		if ok && provider.HasProtocol(ProtocolAnthropic) {
 			return true
 		}
 	}
 	return false
 }
 
-func (r *Router) candidates(model *Model, operation string, preferred WireFormat, video bool) ([]candidate, error) {
+func (r *Router) candidates(model *Model, preferred WireFormat, video bool) ([]candidate, error) {
 	candidates := make([]candidate, 0, len(model.Providers))
+	allowed := []ProviderProtocol(nil)
+	if video {
+		// The Messages API has no video content block, so only
+		// OpenAI-compatible endpoints can serve this request.
+		allowed = []ProviderProtocol{ProtocolOpenAI}
+	}
 	for _, modelProvider := range model.Providers {
 		provider, ok := r.cfg.Providers[modelProvider.ProviderID]
 		if !ok {
 			return nil, util.New(500, fmt.Sprintf("Provider %q is not configured.", modelProvider.ProviderID),
 				"api_error", "internal_error", nil)
 		}
-		endpoint, wireFormat, ok := provider.OutboundFor(operation, preferred)
+		endpoint, protocol, ok := provider.OutboundFor(preferred, allowed...)
 		if !ok {
-			continue
-		}
-		if video && provider.Protocol != ProtocolOpenAI {
-			// The Messages API has no video content block, so those providers
-			// cannot serve this request.
 			continue
 		}
 		candidates = append(candidates, candidate{
 			provider:      provider,
 			modelProvider: modelProvider,
-			wireFormat:    wireFormat,
-			endpoint:      endpoint,
+			protocol:      protocol,
+			wireFormat:    endpoint.Wire,
+			endpoint:      endpoint.Path,
 		})
 	}
 	if len(candidates) == 0 {
@@ -290,9 +291,10 @@ func (r *Router) candidates(model *Model, operation string, preferred WireFormat
 				fmt.Sprintf("Model %q providers do not support video input.", model.ID),
 				"", "unsupported_media", nil)
 		}
-		return nil, util.New(400,
-			fmt.Sprintf("Model %q has no provider supporting operation %q", model.ID, operation),
-			"", "endpoint_not_supported", nil)
+		// Configuration guarantees every provider has at least one endpoint, so
+		// this only triggers on inconsistent state.
+		return nil, util.New(500, fmt.Sprintf("Model %q has no available provider endpoint.", model.ID),
+			"api_error", "internal_error", nil)
 	}
 	return candidates, nil
 }
@@ -303,7 +305,7 @@ func (r *Router) dispatch(
 	prepare func(candidate) (map[string]any, error),
 	video bool,
 ) (*RouteResult, error) {
-	candidates, err := r.candidates(req.Model, req.Operation, req.PreferredFormat, video)
+	candidates, err := r.candidates(req.Model, req.PreferredFormat, video)
 	if err != nil {
 		return nil, err
 	}
@@ -328,7 +330,7 @@ func (r *Router) dispatch(
 				return nil, gatewayError
 			}
 			r.logger.Error("failed to format upstream request",
-				"provider", target.provider.ID, "operation", req.Operation, "error", err)
+				"provider", target.provider.ID, "error", err)
 			return nil, util.New(500, "Failed to format upstream request.",
 				"api_error", "internal_error", nil)
 		}
@@ -378,11 +380,11 @@ func (r *Router) attempt(
 	}
 
 	provider := target.provider
-	headers := upstreamHeaders(provider, req.Stream, req.InboundHeaders)
+	headers := upstreamHeaders(provider, target.protocol, req.Stream, req.InboundHeaders)
 	readTimeout := readTimeoutFor(req.Model, provider)
 	attempts := provider.MaxRetries + 1
 	client := r.clients[provider.Proxy]
-	url := provider.URLFor(target.endpoint)
+	url := provider.URLFor(target.protocol, target.endpoint)
 
 	var lastRetryable *RouteResult
 	var lastErr error
@@ -584,7 +586,7 @@ func (r *Router) unpin(requestID string) {
 	r.removeLocked(requestID)
 }
 
-func upstreamHeaders(provider *Provider, stream bool, inbound map[string]string) http.Header {
+func upstreamHeaders(provider *Provider, protocol ProviderProtocol, stream bool, inbound map[string]string) http.Header {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
 	if stream {
@@ -595,13 +597,13 @@ func upstreamHeaders(provider *Provider, stream bool, inbound map[string]string)
 	headers.Set("User-Agent", "llm-proxy/"+Version)
 
 	if provider.Key != "" {
-		if provider.Protocol == ProtocolAnthropic {
+		if protocol == ProtocolAnthropic {
 			headers.Set("x-api-key", provider.Key)
 		} else {
 			headers.Set("Authorization", "Bearer "+provider.Key)
 		}
 	}
-	if provider.Protocol == ProtocolAnthropic {
+	if protocol == ProtocolAnthropic {
 		version := inbound["anthropic-version"]
 		if version == "" {
 			version = defaultAnthropicVersion

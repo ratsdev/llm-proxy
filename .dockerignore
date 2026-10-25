@@ -6,8 +6,8 @@
 coverage.out
 
 # Local configuration and secrets are mounted at runtime instead
-config.toml
-config.local.toml
+config.yaml
+config.local.yaml
 .env
 .env.*
 

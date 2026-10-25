@@ -34,8 +34,8 @@ func run(args []string) int {
 		logLevel    string
 		showVersion bool
 	)
-	flags.StringVar(&configPath, "config", "", "path to the TOML configuration file")
-	flags.StringVar(&configPath, "c", "", "path to the TOML configuration file (shorthand)")
+	flags.StringVar(&configPath, "config", "", "path to the YAML configuration file")
+	flags.StringVar(&configPath, "c", "", "path to the YAML configuration file (shorthand)")
 	flags.StringVar(&host, "host", "", "listen address (overrides server.host)")
 	flags.IntVar(&port, "port", 0, "listen port (overrides server.port)")
 	flags.StringVar(&logLevel, "log-level", "", "log level: debug, info, warning, error")

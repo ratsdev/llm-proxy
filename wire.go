@@ -1,7 +1,6 @@
 package llmproxy
 
 import (
-	"slices"
 	"strings"
 )
 
@@ -41,43 +40,38 @@ func protocolList() string {
 const apiPrefix = "/api"
 
 // routeSpec is the single source of truth for a gateway route: which inbound
-// path it serves, which provider endpoint implements it, the wire format used
-// on both sides, and the operations the endpoint can serve. Routing, provider
-// endpoint validation and the index document all derive from this table.
+// path it serves, which provider endpoint implements it, and the wire format
+// used on both sides. Routing, provider endpoint validation and the index
+// document all derive from this table.
 type routeSpec struct {
-	wire      WireFormat
-	protocol  ProviderProtocol
+	wire     WireFormat
+	protocol ProviderProtocol
+	// configKey is the name a provider uses for this endpoint in the
+	// configuration file.
+	configKey string
 	endpoint  string
 	inbound   string
-	operation string
-	serves    []string
-	isDefault bool
-	advertise bool
+	// enabledByDefault marks endpoints a provider enables when its endpoints
+	// field is omitted.
+	enabledByDefault bool
+	advertise        bool
 }
 
 var routeSpecs = []routeSpec{
 	{
-		wire: wireOpenAI, protocol: ProtocolOpenAI,
+		wire: wireOpenAI, protocol: ProtocolOpenAI, configKey: "chat_completions",
 		endpoint: "/chat/completions", inbound: apiPrefix + "/v1/chat/completions",
-		operation: "chat", serves: []string{"chat", "responses"},
-		isDefault: true, advertise: true,
+		enabledByDefault: true, advertise: true,
 	},
 	{
-		wire: wireResponses, protocol: ProtocolOpenAI,
+		wire: wireResponses, protocol: ProtocolOpenAI, configKey: "responses",
 		endpoint: "/responses", inbound: apiPrefix + "/v1/responses",
-		operation: "responses", serves: []string{"chat", "responses"},
-		advertise: true,
+		enabledByDefault: true, advertise: true,
 	},
 	{
-		wire: wireOpenAI, protocol: ProtocolOpenAI,
-		endpoint: "/embeddings", inbound: apiPrefix + "/v1/embeddings",
-		operation: "embeddings", serves: []string{"embeddings"},
-	},
-	{
-		wire: wireAnthropic, protocol: ProtocolAnthropic,
-		endpoint: "/messages", inbound: apiPrefix + "/v1/messages",
-		operation: "chat", serves: []string{"chat", "responses"},
-		isDefault: true, advertise: true,
+		wire: wireAnthropic, protocol: ProtocolAnthropic, configKey: "messages",
+		endpoint: "/v1/messages", inbound: apiPrefix + "/v1/messages",
+		enabledByDefault: true, advertise: true,
 	},
 }
 
@@ -90,37 +84,38 @@ func routeSpecForInbound(path string) (routeSpec, bool) {
 	return routeSpec{}, false
 }
 
-func routeSpecForEndpoint(path string) (routeSpec, bool) {
+// routeSpecForConfigKey resolves a provider endpoint name from the
+// configuration file.
+func routeSpecForConfigKey(key string) (routeSpec, bool) {
 	for _, spec := range routeSpecs {
-		if spec.endpoint == path {
+		if spec.configKey == key {
 			return spec, true
 		}
 	}
 	return routeSpec{}, false
 }
 
-func endpointAllowed(protocol ProviderProtocol, path string) bool {
-	spec, ok := routeSpecForEndpoint(path)
-	return ok && spec.protocol == protocol
-}
-
-// routeSpecForOperation resolves the route spec for an endpoint when that
-// endpoint implements the given operation.
-func routeSpecForOperation(path, operation string) (routeSpec, bool) {
-	spec, ok := routeSpecForEndpoint(path)
-	if !ok || !slices.Contains(spec.serves, operation) {
-		return routeSpec{}, false
-	}
-	return spec, true
-}
-
-func defaultEndpoint(protocol ProviderProtocol) string {
+// routeSpecsForProtocol returns the route table entries for one protocol.
+func routeSpecsForProtocol(protocol ProviderProtocol) []routeSpec {
+	specs := make([]routeSpec, 0, len(routeSpecs))
 	for _, spec := range routeSpecs {
-		if spec.protocol == protocol && spec.isDefault {
-			return spec.endpoint
+		if spec.protocol == protocol {
+			specs = append(specs, spec)
 		}
 	}
-	return ""
+	return specs
+}
+
+// defaultRouteSpecs returns the upstream endpoints a provider enables for a
+// protocol when its endpoints field is omitted.
+func defaultRouteSpecs(protocol ProviderProtocol) []routeSpec {
+	specs := make([]routeSpec, 0, len(routeSpecs))
+	for _, spec := range routeSpecsForProtocol(protocol) {
+		if spec.enabledByDefault {
+			specs = append(specs, spec)
+		}
+	}
+	return specs
 }
 
 // wireForPath reports the wire format an inbound path speaks. Unknown paths
@@ -131,10 +126,4 @@ func wireForPath(path string) WireFormat {
 		return spec.wire
 	}
 	return wireOpenAI
-}
-
-// chatFamily reports whether the route speaks a chat-family protocol that can
-// be translated across wires. Embeddings stay an opaque payload.
-func (s routeSpec) chatFamily() bool {
-	return s.operation != "embeddings"
 }

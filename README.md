@@ -38,10 +38,9 @@ A self-hosted, multi-protocol LLM gateway written in Go. Give every client one e
 
 | Inbound endpoint | Wire format | Can be served by upstream endpoints |
 | --- | --- | --- |
-| `POST /api/v1/chat/completions` | OpenAI Chat Completions | `/chat/completions`, `/responses`, `/messages` |
-| `POST /api/v1/responses` | OpenAI Responses | `/responses`, `/chat/completions`, `/messages` |
-| `POST /api/v1/messages` | Anthropic Messages | `/messages`, `/chat/completions`, `/responses` |
-| `POST /api/v1/embeddings` | OpenAI Embeddings | `/embeddings` (opaque passthrough) |
+| `POST /api/v1/chat/completions` | OpenAI Chat Completions | `/chat/completions`, `/responses`, `/v1/messages` |
+| `POST /api/v1/responses` | OpenAI Responses | `/responses`, `/chat/completions`, `/v1/messages` |
+| `POST /api/v1/messages` | Anthropic Messages | `/v1/messages`, `/chat/completions`, `/responses` |
 
 The gateway also exposes:
 
@@ -53,12 +52,17 @@ The gateway also exposes:
 | `GET /api/v1/models/{model_id}` | Model metadata (ACL-checked) |
 | `GET /ui` | Read-only Web UI, unlocked with an API key |
 
-A provider may declare several endpoints. The router prefers the endpoint that matches the inbound wire format and otherwise falls back to the first compatible chat-family endpoint, converting as needed.
+A provider may declare several endpoints. The router prefers the endpoint that matches the inbound wire format and otherwise falls back to the first compatible endpoint, converting as needed.
 
-| Provider `protocol` | Allowed `endpoints` | Default |
-| --- | --- | --- |
-| `openai` | `/chat/completions`, `/responses`, `/embeddings` | `/chat/completions` |
-| `anthropic` | `/messages` | `/messages` |
+Omitting `endpoints` enables every default endpoint for each configured protocol. Declaring it switches that protocol to an allow-list: only the listed endpoints are enabled, and an empty path uses the default path. Protocols left out of the `endpoints` table keep every default endpoint. A custom path must be a URL path: it starts with `/` and has no scheme, host, query, fragment, or whitespace.
+
+| Protocol | Endpoint name | Default path | Enabled when the protocol is not listed under `endpoints` |
+| --- | --- | --- | --- |
+| `openai` | `chat_completions` | `/chat/completions` | yes |
+| `openai` | `responses` | `/responses` | yes |
+| `anthropic` | `messages` | `/v1/messages` | yes |
+
+A provider may declare base URLs and endpoints for both protocols at once.
 
 ## Quick start
 
@@ -70,11 +74,11 @@ Requires Go 1.26 or newer.
 git clone https://github.com/ratsdev/llm-proxy.git
 cd llm-proxy
 
-cp config.example.toml config.toml
-$EDITOR config.toml
+cp config.example.yaml config.yaml
+$EDITOR config.yaml
 
 go build -o bin/llm-proxy ./cmd/llm-proxy
-./bin/llm-proxy --config config.toml
+./bin/llm-proxy --config config.yaml
 ```
 
 The gateway listens on `0.0.0.0:4000` by default. Every API route lives under `/api`, so the base URL is `http://127.0.0.1:4000/api/`; unknown paths outside the UI and API prefixes return `404`. Append `/v1` for OpenAI-style clients (for example `http://127.0.0.1:4000/api/v1`). The Web UI is at `http://127.0.0.1:4000/ui` and signs in with any configured user `api_key`.
@@ -83,7 +87,7 @@ The gateway listens on `0.0.0.0:4000` by default. Every API route lives under `/
 
 ```bash
 docker run --rm -p 4000:4000 \
-  -v "$PWD/config.toml:/etc/llm-proxy/config.toml:ro" \
+  -v "$PWD/config.yaml:/etc/llm-proxy/config.yaml:ro" \
   ghcr.io/ratsdev/llm-proxy:latest
 ```
 
@@ -101,14 +105,14 @@ Images are published to `ghcr.io/ratsdev/llm-proxy` and to Docker Hub as `docker
 
 Use `stable` for production and pin an exact version when reproducibility matters; `latest` intentionally tracks the newest build and may include release candidates.
 
-The image reads its config from `/etc/llm-proxy/config.toml` and runs as `root`, which lets it read a mounted file that is owned by root and kept at mode `0600`. Mount the file read-only; never bake credentials into the image. If you prefer an unprivileged container, start it with `--user` and make the mounted config readable by that UID.
+The image reads its config from `/etc/llm-proxy/config.yaml` and runs as `root`, which lets it read a mounted file that is owned by root and kept at mode `0600`. Mount the file read-only; never bake credentials into the image. If you prefer an unprivileged container, start it with `--user` and make the mounted config readable by that UID.
 
 ### CLI flags
 
 ```
 llm-proxy --config <path> [--host <addr>] [--port <port>] [--log-level <level>] [--version]
 
-  -c, --config     path to the TOML configuration file (required)
+  -c, --config     path to the YAML configuration file (required)
       --host       listen address, overrides server.host
       --port       listen port, overrides server.port
       --log-level  debug | info | warning | error
@@ -119,102 +123,128 @@ Flags take precedence over the config file.
 
 ## Configuration
 
-`config.toml` is deliberately git-ignored because it contains provider keys and user API keys. Unknown keys are rejected at startup so a typo such as `protcol` cannot silently fall back to a default.
+`config.yaml` is deliberately git-ignored because it contains provider keys and user API keys. It must contain a single YAML document and must not be empty. Unknown keys are rejected at startup so a typo such as `protcol` cannot silently fall back to a default. Provider, model, and user IDs are the map keys themselves and may not have leading or trailing whitespace.
 
-```toml
-[general]
-# Drop null values and litellm_/underscore-prefixed fields when forwarding a
-# same-wire request verbatim.
-drop_params = true
+```yaml
+general:
+  # Drop null values and litellm_/underscore-prefixed fields when forwarding a
+  # same-wire request verbatim.
+  drop_params: true
 
-[server]
-host = "0.0.0.0"
-port = 4000
-# server.log_level wins over general.log_level.
-log_level = "info"
+server:
+  host: "0.0.0.0"
+  port: 4000
+  # server.log_level wins over general.log_level.
+  log_level: "info"
 
-[[providers]]
-id = "openai-prod"                     # unique provider id
-protocol = "openai"                    # openai | anthropic
-base_url = "https://api.openai.com/v1" # endpoint paths are appended
-key = "sk-..."                         # Bearer token, or x-api-key for anthropic
-max_retries = 2                        # 0-10, default 2
-timeout = 120                          # optional request/stream idle timeout (seconds)
-endpoints = ["/chat/completions", "/responses"]
-# headers = { "x-custom-header" = "value" }  # applied last; can override auth headers
-# proxy = "socks5://user:pass@127.0.0.1:1080" # http(s) or socks5(h), no env proxy
+providers:
+  openai-prod:
+    name: "OpenAI production"
+    base_url:
+      openai: "https://api.openai.com/v1" # endpoint paths are appended
+    api_key: "sk-..."                     # Bearer token, or x-api-key for anthropic
+    max_retries: 2                        # 0-10, default 2
+    timeout: 120                          # optional request/stream idle timeout (seconds)
+    # endpoints is omitted: every default endpoint for the openai protocol is
+    # enabled. Declare endpoints to restrict the set; an empty path means the
+    # default path.
+    # headers:                            # applied last; can override auth headers
+    #   x-custom-header: "value"
+    # proxy: "socks5://user:pass@127.0.0.1:1080" # http(s) or socks5(h), no env proxy
 
-[[providers]]
-id = "anthropic-prod"
-protocol = "anthropic"
-base_url = "https://api.anthropic.com/v1"
-key = "sk-ant-..."
-max_retries = 2
-endpoints = ["/messages"]
+  anthropic-prod:
+    name: "Anthropic production"
+    base_url:
+      anthropic: "https://api.anthropic.com" # messages defaults to /v1/messages
+    api_key: "sk-ant-..."
 
-[[models]]
-id = "chat-default"                    # the name clients send in "model"
-context_length = 128000               # metadata for /api/v1/models
-max_output_length = 16384             # default max tokens after cross-wire conversion
-modalities = ["text", "image"]        # metadata for /api/v1/models
-timeout = 300                          # optional, overrides provider.timeout
-providers = [
-    { provider_id = "openai-prod",    model = "gpt-4.1-mini", weight = 0.7 },
-    { provider_id = "anthropic-prod", model = "claude-sonnet-4", weight = 0.3 },
-]
+  # One provider can expose both protocol base URLs and endpoint tables.
+  dual-provider:
+    base_url:
+      openai: "https://gateway.example.com/v1"
+      anthropic: "https://gateway.example.com"
+    api_key: "sk-dual"
+    # Declaring endpoints enables only these two; the empty values use the
+    # default paths (/chat/completions and /v1/messages).
+    endpoints:
+      openai:
+        chat_completions:
+      anthropic:
+        messages:
 
-[[users]]
-id = "alice"
-api_key = "sk-alice"
-allowed_models = ["chat-default"]     # omit to allow every model; "*" also works
+models:
+  chat-default:                           # the name clients send in "model"
+    name: "Chat default"
+    context_length: 128000                # metadata for /api/v1/models
+    max_output_length: 16384              # default max tokens after cross-wire conversion
+    modalities:
+      input: ["text", "image"]            # metadata for /api/v1/models
+      output: ["text"]
+    timeout: 300                           # optional, overrides provider.timeout
+    providers:
+      - provider_id: "openai-prod"
+        model_id: "gpt-4.1-mini"
+        weight: 0.7
+      - provider_id: "anthropic-prod"
+        model_id: "claude-sonnet-4"
+        weight: 0.3
 
-[[users]]
-id = "bob"
-api_key = "sk-bob"
-allowed_models = ["*"]
+users:
+  alice:
+    name: "Alice"
+    api_key: "sk-alice"
+    allowed_models: ["chat-default"]     # omit to allow every model; "*" also works
+
+  bob:
+    name: "Bob"
+    api_key: "sk-bob"
+    allowed_models: ["*"]
 ```
 
 ### Providers
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `id` | yes | Unique provider identifier. |
-| `base_url` | yes | `http` or `https` base URL; trailing slashes are stripped. Endpoint paths are appended verbatim, so include the version prefix (`/v1`). |
-| `protocol` | no | `openai` (default) or `anthropic`. Controls auth headers and which endpoints may be declared. |
-| `key` | no | Sent as `Authorization: Bearer <key>` for OpenAI, `x-api-key: <key>` for Anthropic. |
+| `base_url` | yes | Mapping keyed by protocol (`openai`, `anthropic`). At least one protocol is required. Each value must be an `http` or `https` base URL; trailing slashes are stripped. Endpoint paths are appended verbatim, so include any version prefix. The default Anthropic messages path is `/v1/messages`, so an Anthropic base URL normally omits `/v1` unless you override the path. |
+| `api_key` | no | Sent as `Authorization: Bearer <key>` for OpenAI endpoints, `x-api-key: <key>` for Anthropic endpoints. |
+| `name` | no | Human-readable label shown in the Web UI; the provider ID is shown when empty. |
 | `max_retries` | no | Retries per request on transient failures, `0`-`10`, default `2`. |
 | `timeout` | no | Request and stream-idle timeout in seconds. Default `600`. |
-| `endpoints` | no | Upstream paths this provider implements. Defaults to the protocol's default endpoint. Duplicates are ignored. |
+| `endpoints` | no | Optional per-protocol allow-list mapping protocol to endpoint name to upstream path. When omitted, every default endpoint for each configured protocol is enabled. When present, a listed protocol keeps only its listed endpoints; a missing or empty path uses the default path, and protocols left out keep every default endpoint. Endpoint names are `chat_completions`, `responses`, and `messages`. Custom paths must start with `/` and may not include a scheme, host, query, fragment, or whitespace. |
 | `headers` | no | Extra headers applied last. They can override `Authorization`, `Accept`, and other defaults. |
 | `proxy` | no | HTTP(S) or SOCKS5 proxy for this provider. Environment proxy variables are never consulted. |
+
+The map key is the provider ID. When routing a chat request, the preferred protocol matches the inbound wire format: OpenAI-style requests use the provider's `openai` endpoints, and Anthropic-style requests use its `anthropic` endpoints. If the preferred protocol is unavailable, the router falls back to another compatible endpoint and translates the request.
 
 ### Models
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `id` | yes | Client-visible model alias. It may contain slashes. |
-| `providers` | yes | Non-empty list of `{ provider_id, model, weight }`. `model` is the upstream model name. |
+| `providers` | yes | Non-empty list of `{ provider_id, model_id, weight }`. `model_id` is the upstream model name. |
 | `weight` | no | Positive routing weight. Declare weights for all providers or none; declared weights must sum to `1.0`. |
+| `name` | no | Human-readable label shown in the Web UI; the model alias is shown when empty. |
 | `context_length` | no | Metadata returned by the models API. |
 | `max_output_length` | no | Default output token budget when a request is converted across formats and does not specify one. |
-| `modalities` | no | Metadata returned by the models API. Defaults to `["text"]`. |
+| `modalities` | no | `input` and `output` modality lists returned by the models API. Each defaults to `["text"]`. |
 | `timeout` | no | Overrides the provider timeout for this model. |
 
-If no weights are declared, every provider gets weight `1.0` (equal selection probability).
+The map key is the client-visible model alias. It may contain slashes. If no weights are declared, every provider gets weight `1.0` (equal selection probability).
 
 ### Users
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `id` | yes | Unique user identifier, used in logs. |
 | `api_key` | yes | Bearer token or `x-api-key` value. Must be unique. |
+| `name` | no | Human-readable label shown in the Web UI; the user ID is shown when empty. |
 | `allowed_models` | no | Model allow-list. Omit for unrestricted access; `"*"` is a wildcard. |
 
-**Authentication is disabled entirely when there are no `[[users]]`.** Do not expose an unauthenticated instance to the internet.
+The map key is the unique user identifier used in logs.
+
+**Authentication is disabled entirely when there are no users configured.** Do not expose an unauthenticated instance to the internet.
 
 ## Web UI
 
-Open `http://127.0.0.1:4000/ui` and sign in with any `api_key` from the `[[users]]` section. The console is **read-only**: it has no endpoints for changing providers, models, users, or routing. Configuration changes still require editing `config.toml` and restarting the process.
+Open `http://127.0.0.1:4000/ui` and sign in with any `api_key` from the `users` section. The console is **read-only**: it has no endpoints for changing providers, models, users, or routing. Configuration changes still require editing `config.yaml` and restarting the process.
 
 The console's API lives under `/api/ui`: `POST /api/ui/login`, `POST /api/ui/logout`, and the session-scoped `GET /api/ui/session`, `/api/ui/overview`, `/api/ui/models`, `/api/ui/providers`, and `/api/ui/requests`.
 
@@ -222,16 +252,16 @@ The console's API lives under `/api/ui`: `POST /api/ui/login`, `POST /api/ui/log
 | --- | --- |
 | Overview | Gateway version, uptime, success rate, token totals, 24-hour activity, traffic by model and provider, recent requests |
 | Models | Public model aliases with context/output metadata, modalities, provider bindings, upstream model names, and weights |
-| Providers | Provider protocol, base URL, endpoints, retry/timeout settings, proxy scheme, and which of your models use it |
+| Providers | Provider protocols, base URLs, endpoints, retry/timeout settings, proxy scheme, and which of your models use it |
 | Requests | Recent model traffic owned by the signed-in key: request ID, model, provider, protocol, stream flag, status, latency, and tokens |
-| Account | Your user ID, session expiry, and model allow-list |
+| Account | Your user identity, session expiry, and model allow-list |
 
 The UI honours each user's `allowed_models` ACL: models, providers, and request history are all scoped to the signed-in key. Provider keys, custom headers, and other users' API keys are never sent to the browser.
 
 Details worth knowing:
 
 - **Key login only.** Login exchanges a configured API key for an in-memory session cookie (`HttpOnly`, `SameSite=Strict`, 12-hour TTL). Raw keys are not stored in browser storage. Restarting the gateway invalidates every session.
-- **No users, no UI.** When there are no `[[users]]`, the Web UI returns `403` with an explanation instead of exposing an unauthenticated console.
+- **No users, no UI.** When there are no users configured, the Web UI returns `403` with an explanation instead of exposing an unauthenticated console.
 - **In-memory statistics.** The dashboard and request log keep the latest 5,000 model requests in process memory. They reset on restart, and they are not a billing or audit system.
 - **No writes.** Every UI API route is `GET` except login/logout; other methods return `405`. The only browser state is the session cookie.
 
@@ -325,7 +355,7 @@ print(message.content[0].text)
 For each request the gateway:
 
 1. Authenticates the caller and resolves the model alias.
-2. Builds candidates from the model's provider list, dropping providers that cannot serve the operation or the content (for example, video requests never go to Anthropic-protocol providers).
+2. Builds candidates from the model's provider list, dropping providers that cannot serve the request's content (for example, video requests never go to Anthropic endpoints).
 3. Orders candidates by weight, unless a sticky entry for the request ID exists.
 4. Sends the request to each candidate in order, retrying transient failures up to that provider's `max_retries`.
 5. Fails over to the next provider on retryable errors.
@@ -356,7 +386,7 @@ Cross-wire requests are parsed into the IR and re-encoded for the selected upstr
 - stop reasons and stop sequences;
 - Anthropic `cache_control` hints when the upstream is Anthropic.
 
-Some fields do not have an equivalent in every format and are dropped on a cross-wire hop. Embeddings are never translated: they are proxied opaquely to a provider that declares `/embeddings`.
+Some fields do not have an equivalent in every format and are dropped on a cross-wire hop.
 
 Streaming behavior:
 
@@ -390,7 +420,7 @@ Every request is parsed into a small protocol-neutral IR (`ir/`), routed to a pr
 | `proxy.go` | Inbound request handling and response/SSE relay |
 | `router.go` | Candidate selection, weighted order, retries, failover, sticky cache |
 | `wire.go` | Single source of truth for inbound routes and provider endpoints |
-| `config.go` | TOML loading and validation |
+| `config.go` | YAML loading and validation |
 | `ui.go` | Read-only Web UI handlers, key-derived sessions, request history |
 | `assets/` | Embedded HTML/CSS/JS console assets (no build step) |
 | `client.go` | Upstream HTTP clients, timeouts, HTTP/SOCKS5 proxies |
@@ -417,8 +447,7 @@ go build -trimpath \
 
 ## Limitations
 
-- No embeddings translation; embeddings only pass through to `/embeddings` upstreams.
-- Anthropic-protocol providers cannot receive video content.
+- Anthropic endpoints cannot receive video content.
 - Cross-wire conversion covers the common chat surface, not every vendor-specific extension.
 - No per-user rate limiting, quotas, cost accounting, write/admin UI, or config hot reload. The Web UI is display-only.
 - Web UI statistics are per-process and in-memory; they are not persisted and do not survive a restart.
@@ -427,8 +456,8 @@ go build -trimpath \
 
 ## Security
 
-- Provider keys and user API keys are stored in plaintext in `config.toml`. Keep the file mode `0600`, mount it read-only in containers, and never commit it.
-- With no `[[users]]`, anyone who can reach the port can use every model and the Web UI stays disabled. Put the gateway behind a private network, VPN, or authenticating reverse proxy.
+- Provider keys and user API keys are stored in plaintext in `config.yaml`. Keep the file mode `0600`, mount it read-only in containers, and never commit it.
+- With no users configured, anyone who can reach the port can use every model and the Web UI stays disabled. Put the gateway behind a private network, VPN, or authenticating reverse proxy.
 - The Web UI exchanges an API key for a session cookie and never exposes provider keys, custom headers, or other users' keys. Serve it over HTTPS through your reverse proxy so the cookie stays confidential.
 - Treat configured provider headers as privileged: they are applied after authentication headers and can override them.
 

@@ -8,57 +8,71 @@ import (
 )
 
 const baseConfig = `
-[general]
-drop_params = true
+general:
+  drop_params: true
 
-[server]
-host = "127.0.0.1"
-port = 4100
-log_level = "debug"
+server:
+  host: "127.0.0.1"
+  port: 4100
+  log_level: "debug"
 
-[[providers]]
-id = "p1"
-protocol = "openai"
-base_url = "https://example.test/v1/"
-key = "k1"
-max_retries = 3
-endpoints = ["chat/completions", "/chat/completions", "/responses"]
-headers = { "x-extra" = "yes" }
+providers:
+  p1:
+    name: "Provider One"
+    base_url:
+      openai: "https://example.test/v1/"
+    api_key: " k1 "
+    max_retries: 3
+    endpoints:
+      openai:
+        chat_completions: "/chat/completions"
+        responses: "/responses"
+    headers:
+      x-extra: "yes"
 
-[[providers]]
-id = "p2"
-protocol = "anthropic"
-base_url = "https://anthropic.test"
-endpoints = ["/messages"]
+  p2:
+    name: "Provider Two"
+    base_url:
+      anthropic: "https://anthropic.test"
+    endpoints:
+      anthropic:
+        messages: "/messages"
 
-[[models]]
-id = "model/a"
-context_length = 1000
-max_output_length = 100
-modalities = ["text", "image"]
-timeout = 12.5
-providers = [
-  { provider_id = "p1", model = "up-a", weight = 0.4 },
-  { provider_id = "p2", model = "up-b", weight = 0.6 },
-]
+models:
+  model/a:
+    name: "Model A"
+    context_length: 1000
+    max_output_length: 100
+    modalities:
+      input: ["text", "image"]
+      output: ["text"]
+    timeout: 12.5
+    providers:
+      - provider_id: "p1"
+        model_id: "up-a"
+        weight: 0.4
+      - provider_id: "p2"
+        model_id: "up-b"
+        weight: 0.6
 
-[[models]]
-id = "model/b"
-providers = [{ provider_id = "p1", model = "up-c" }]
+  model/b:
+    providers:
+      - provider_id: "p1"
+        model_id: "up-c"
 
-[[users]]
-id = "alice"
-api_key = "key-a"
-allowed_models = ["model/a"]
+users:
+  alice:
+    name: "Alice"
+    api_key: "key-a"
+    allowed_models: ["model/a"]
 
-[[users]]
-id = "bob"
-api_key = "key-b"
+  bob:
+    api_key: "key-b"
 `
 
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "config.toml")
+	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -81,24 +95,34 @@ func TestLoadConfigValid(t *testing.T) {
 	}
 
 	provider := cfg.Providers["p1"]
-	if provider.BaseURL != "https://example.test/v1" {
-		t.Fatalf("base url = %q", provider.BaseURL)
+	if provider.Name != "Provider One" {
+		t.Fatalf("provider name = %q", provider.Name)
 	}
-	if provider.MaxRetries != 3 || provider.Key != "k1" || provider.Protocol != "openai" {
+	if provider.BaseURLs[ProtocolOpenAI] != "https://example.test/v1" {
+		t.Fatalf("base url = %q", provider.BaseURLs[ProtocolOpenAI])
+	}
+	if provider.MaxRetries != 3 || provider.Key != "k1" {
 		t.Fatalf("provider = %+v", provider)
 	}
-	if len(provider.Endpoints) != 2 || provider.Endpoints[0] != "/chat/completions" || provider.Endpoints[1] != "/responses" {
-		t.Fatalf("endpoints = %v", provider.Endpoints)
+	endpoints := provider.Endpoints[ProtocolOpenAI]
+	if len(endpoints) != 2 ||
+		endpoints[0].Name != "chat_completions" || endpoints[0].Path != "/chat/completions" ||
+		endpoints[1].Name != "responses" || endpoints[1].Path != "/responses" {
+		t.Fatalf("endpoints = %+v", endpoints)
 	}
 	if provider.Headers["x-extra"] != "yes" {
 		t.Fatalf("headers = %v", provider.Headers)
 	}
 
-	if got := cfg.Providers["p2"].Endpoints; len(got) != 1 || got[0] != "/messages" {
-		t.Fatalf("anthropic endpoints = %v", got)
+	anthropicEndpoints := cfg.Providers["p2"].Endpoints[ProtocolAnthropic]
+	if len(anthropicEndpoints) != 1 || anthropicEndpoints[0].Path != "/messages" {
+		t.Fatalf("anthropic endpoints = %+v", anthropicEndpoints)
 	}
 
 	model := cfg.Models["model/a"]
+	if model.Name != "Model A" {
+		t.Fatalf("model name = %q", model.Name)
+	}
 	if model.ContextLength == nil || *model.ContextLength != 1000 {
 		t.Fatalf("context length = %v", model.ContextLength)
 	}
@@ -111,17 +135,27 @@ func TestLoadConfigValid(t *testing.T) {
 	if len(model.Modalities) != 2 || model.Modalities[1] != "image" {
 		t.Fatalf("modalities = %v", model.Modalities)
 	}
+	if len(model.OutputModalities) != 1 || model.OutputModalities[0] != "text" {
+		t.Fatalf("output modalities = %v", model.OutputModalities)
+	}
 	if len(model.Providers) != 2 || model.Providers[0].Weight != 0.4 || model.Providers[1].UpstreamModel != "up-b" {
 		t.Fatalf("model providers = %+v", model.Providers)
 	}
 
-	if got := cfg.Models["model/b"].Modalities; len(got) != 1 || got[0] != "text" {
-		t.Fatalf("default modalities = %v", got)
+	defaultModel := cfg.Models["model/b"]
+	if len(defaultModel.Modalities) != 1 || defaultModel.Modalities[0] != "text" {
+		t.Fatalf("default modalities = %v", defaultModel.Modalities)
 	}
-	if got := cfg.Models["model/b"].Providers[0].Weight; got != 1.0 {
+	if len(defaultModel.OutputModalities) != 1 || defaultModel.OutputModalities[0] != "text" {
+		t.Fatalf("default output modalities = %v", defaultModel.OutputModalities)
+	}
+	if got := defaultModel.Providers[0].Weight; got != 1.0 {
 		t.Fatalf("default weight = %v", got)
 	}
 
+	if cfg.UsersByKey["key-a"].Name != "Alice" {
+		t.Fatalf("user name = %q", cfg.UsersByKey["key-a"].Name)
+	}
 	if !cfg.UsersByKey["key-a"].CanUse("model/a") {
 		t.Fatal("alice should use model/a")
 	}
@@ -137,9 +171,10 @@ func TestLoadConfigDefaults(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := LoadConfig(writeConfig(t, `
-[[providers]]
-id = "p"
-base_url = "https://example.test"
+providers:
+  p:
+    base_url:
+      openai: "https://example.test"
 `))
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -151,11 +186,145 @@ base_url = "https://example.test"
 		t.Fatalf("defaults = %+v", cfg)
 	}
 	provider := cfg.Providers["p"]
-	if provider.Protocol != "openai" || provider.MaxRetries != 2 {
+	if provider.MaxRetries != 2 {
 		t.Fatalf("provider defaults = %+v", provider)
 	}
-	if len(provider.Endpoints) != 1 || provider.Endpoints[0] != "/chat/completions" {
-		t.Fatalf("default endpoints = %v", provider.Endpoints)
+	defaults := provider.Endpoints[ProtocolOpenAI]
+	wantPaths := []string{"/chat/completions", "/responses"}
+	if len(defaults) != len(wantPaths) {
+		t.Fatalf("default endpoints = %+v", provider.Endpoints)
+	}
+	for i, want := range wantPaths {
+		if defaults[i].Path != want {
+			t.Fatalf("default endpoint %d = %q, want %q", i, defaults[i].Path, want)
+		}
+	}
+}
+
+func TestLoadConfigDefaultEndpointsForBothProtocols(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadConfig(writeConfig(t, `
+providers:
+  dual:
+    base_url:
+      openai: "https://openai.test/v1"
+      anthropic: "https://anthropic.test"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	provider := cfg.Providers["dual"]
+	if got := len(provider.Endpoints[ProtocolOpenAI]); got != 2 {
+		t.Fatalf("default openai endpoints = %+v", provider.Endpoints[ProtocolOpenAI])
+	}
+	anthropic := provider.Endpoints[ProtocolAnthropic]
+	if len(anthropic) != 1 || anthropic[0].Path != "/v1/messages" {
+		t.Fatalf("default anthropic endpoints = %+v", anthropic)
+	}
+
+	model := &Model{ID: "m", Providers: []ModelProvider{{ProviderID: "dual", UpstreamModel: "up", Weight: 1}}}
+	router := &Router{cfg: cfg}
+	candidates, err := router.candidates(model, wireAnthropic, false)
+	if err != nil || len(candidates) != 1 || candidates[0].endpoint != "/v1/messages" {
+		t.Fatalf("anthropic candidate = %+v, err = %v", candidates, err)
+	}
+}
+
+func TestLoadConfigEndpointAllowList(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadConfig(writeConfig(t, `
+providers:
+  dual:
+    base_url:
+      openai: "https://openai.test/v1"
+      anthropic: "https://anthropic.test"
+    endpoints:
+      openai:
+        chat_completions:
+        responses: "/custom/responses"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	provider := cfg.Providers["dual"]
+	openai := provider.Endpoints[ProtocolOpenAI]
+	if len(openai) != 2 ||
+		openai[0].Name != "chat_completions" || openai[0].Path != "/chat/completions" ||
+		openai[1].Name != "responses" || openai[1].Path != "/custom/responses" {
+		t.Fatalf("allow-listed openai endpoints = %+v", openai)
+	}
+	if got := provider.Endpoints[ProtocolAnthropic]; len(got) != 1 || got[0].Path != "/v1/messages" {
+		t.Fatalf("unlisted protocols should keep their default endpoints, got %+v", got)
+	}
+}
+
+func TestLoadConfigEmptyEndpointPathUsesDefault(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadConfig(writeConfig(t, `
+providers:
+  p:
+    base_url:
+      openai: "https://openai.test/v1"
+    endpoints:
+      openai:
+        chat_completions: ""
+        responses: "/v1/responses"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	endpoints := cfg.Providers["p"].Endpoints[ProtocolOpenAI]
+	if len(endpoints) != 2 ||
+		endpoints[0].Name != "chat_completions" || endpoints[0].Path != "/chat/completions" ||
+		endpoints[1].Name != "responses" || endpoints[1].Path != "/v1/responses" {
+		t.Fatalf("endpoints = %+v", endpoints)
+	}
+}
+
+func TestLoadConfigDualProtocolProvider(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadConfig(writeConfig(t, `
+providers:
+  dual:
+    base_url:
+      openai: "https://openai.test/v1"
+      anthropic: "https://anthropic.test"
+    endpoints:
+      openai:
+        chat_completions: "/chat/completions"
+        responses: "/responses"
+      anthropic:
+        messages: "/v1/messages"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	provider := cfg.Providers["dual"]
+	if len(provider.Protocols()) != 2 {
+		t.Fatalf("protocols = %v", provider.Protocols())
+	}
+	if got := provider.Endpoints[ProtocolAnthropic]; len(got) != 1 || got[0].Path != "/v1/messages" {
+		t.Fatalf("anthropic endpoints = %+v", got)
+	}
+	if got := provider.URLFor(ProtocolAnthropic, "/v1/messages"); got != "https://anthropic.test/v1/messages" {
+		t.Fatalf("anthropic URL = %q", got)
+	}
+
+	model := &Model{ID: "m", Providers: []ModelProvider{{ProviderID: "dual", UpstreamModel: "up", Weight: 1}}}
+	router := &Router{cfg: cfg}
+	openAICandidate, err := router.candidates(model, wireOpenAI, false)
+	if err != nil || len(openAICandidate) != 1 || openAICandidate[0].protocol != ProtocolOpenAI ||
+		openAICandidate[0].endpoint != "/chat/completions" {
+		t.Fatalf("openai candidate = %+v, err = %v", openAICandidate, err)
+	}
+	anthropicCandidate, err := router.candidates(model, wireAnthropic, false)
+	if err != nil || len(anthropicCandidate) != 1 || anthropicCandidate[0].protocol != ProtocolAnthropic ||
+		anthropicCandidate[0].endpoint != "/v1/messages" {
+		t.Fatalf("anthropic candidate = %+v, err = %v", anthropicCandidate, err)
 	}
 }
 
@@ -168,176 +337,449 @@ func TestLoadConfigRejectsInvalid(t *testing.T) {
 		want    string
 	}{
 		{
-			name:    "provider without id",
-			content: "[[providers]]\nbase_url = \"https://x\"\n",
-			want:    "providers[0].id",
+			name: "provider without id",
+			content: `
+providers:
+  "":
+    base_url:
+      openai: "https://x"
+`,
+			want: "provider ids must be non-empty",
 		},
 		{
-			name:    "unsupported protocol",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\nprotocol = \"gemini\"\n",
-			want:    "protocol",
+			name: "provider id whitespace",
+			content: `
+providers:
+  " p ":
+    base_url:
+      openai: "https://x"
+`,
+			want: "leading or trailing whitespace",
 		},
 		{
-			name:    "bad proxy",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\nproxy = \"ftp://proxy\"\n",
-			want:    "proxy",
+			name: "invalid header name",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    headers:
+      "x-bad name": "value"
+`,
+			want: "not a valid header name",
 		},
 		{
-			name:    "bool max retries",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\nmax_retries = true\n",
-			want:    "max_retries",
+			name: "header value control character",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    headers:
+      x-bad: "a\nb"
+`,
+			want: "control characters",
 		},
 		{
-			name:    "too many retries",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\nmax_retries = 11\n",
-			want:    "max_retries",
+			name: "model id whitespace",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+models:
+  " m ":
+    providers:
+      - provider_id: "p"
+        model_id: "x"
+`,
+			want: "leading or trailing whitespace",
 		},
 		{
-			name:    "nan timeout",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\ntimeout = nan\n",
-			want:    "timeout",
+			name: "user id whitespace",
+			content: `
+users:
+  " alice ":
+    api_key: "k"
+`,
+			want: "leading or trailing whitespace",
 		},
 		{
-			name:    "empty endpoints",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\nendpoints = []\n",
-			want:    "endpoints",
+			name: "unsupported protocol",
+			content: `
+providers:
+  p:
+    base_url:
+      gemini: "https://x"
+`,
+			want: "not supported",
 		},
 		{
-			name:    "unsupported endpoint",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\nendpoints = [\"/foo\"]\n",
-			want:    "unsupported endpoint",
+			name: "bad proxy",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    proxy: "ftp://proxy"
+`,
+			want: "proxy",
 		},
 		{
-			name:    "duplicate provider",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\n[[providers]]\nid = \"p\"\nbase_url = \"https://y\"\n",
-			want:    "duplicate provider",
+			name: "bool max retries",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    max_retries: true
+`,
+			want: "max_retries",
+		},
+		{
+			name: "too many retries",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    max_retries: 11
+`,
+			want: "max_retries",
+		},
+		{
+			name: "nan timeout",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    timeout: .nan
+`,
+			want: "timeout",
+		},
+		{
+			name: "empty endpoints",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    endpoints:
+      openai: {}
+`,
+			want: "non-empty mapping",
+		},
+		{
+			name: "empty endpoint table",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    endpoints: {}
+`,
+			want: "at least one endpoint",
+		},
+		{
+			name: "unsupported endpoint",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    endpoints:
+      openai:
+        foo: "/foo"
+`,
+			want: "not a supported endpoint",
+		},
+		{
+			name: "removed completions alias",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    endpoints:
+      openai:
+        completions: "/completions"
+`,
+			want: "not a supported endpoint",
+		},
+		{
+			name: "endpoint protocol whitespace",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    endpoints:
+      openai:
+        chat_completions: "/chat/completions"
+      " openai ":
+        responses: "/responses"
+`,
+			want: "leading or trailing whitespace",
+		},
+		{
+			name: "base url protocol whitespace",
+			content: `
+providers:
+  p:
+    base_url:
+      " openai ": "https://x"
+`,
+			want: "leading or trailing whitespace",
+		},
+		{
+			name: "relative endpoint path",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    endpoints:
+      openai:
+        chat_completions: "chat/completions"
+`,
+			want: "path starting with",
+		},
+		{
+			name: "endpoint path with query",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    endpoints:
+      openai:
+        chat_completions: "/chat/completions?x=1"
+`,
+			want: "without a scheme, host, query, or fragment",
+		},
+		{
+			name: "endpoint path with whitespace",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    endpoints:
+      openai:
+        chat_completions: "/chat completions"
+`,
+			want: "whitespace",
+		},
+		{
+			name: "endpoint protocol mismatch",
+			content: `
+providers:
+  p:
+    base_url:
+      anthropic: "https://x"
+    endpoints:
+      anthropic:
+        chat_completions: "/chat/completions"
+`,
+			want: "only supported for protocol",
+		},
+		{
+			name: "endpoint without base url",
+			content: `
+providers:
+  p:
+    base_url:
+      anthropic: "https://x"
+    endpoints:
+      openai:
+        chat_completions: "/chat/completions"
+`,
+			want: "requires base_url.openai",
+		},
+		{
+			name: "missing base url",
+			content: `
+providers:
+  p:
+    api_key: "k"
+`,
+			want: "at least one protocol",
 		},
 		{
 			name: "unknown provider reference",
-			content: `[[models]]
-id = "m"
-providers = [{ provider_id = "missing", model = "x" }]
+			content: `
+models:
+  m:
+    providers:
+      - provider_id: "missing"
+        model_id: "x"
 `,
 			want: "unknown provider",
 		},
 		{
 			name: "no providers",
-			content: `[[models]]
-id = "m"
-providers = []
+			content: `
+models:
+  m:
+    providers: []
 `,
 			want: "non-empty array",
 		},
 		{
 			name: "unknown provider keys",
-			content: `[[providers]]
-id = "p"
-base_url = "https://x"
-[[models]]
-id = "m"
-providers = [{ provider_id = "p", model = "x", extra = 1 }]
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+models:
+  m:
+    providers:
+      - provider_id: "p"
+        model_id: "x"
+        extra: 1
 `,
-			want: "unknown keys",
+			want: "extra",
 		},
 		{
 			name: "negative weight",
-			content: `[[providers]]
-id = "p"
-base_url = "https://x"
-[[models]]
-id = "m"
-providers = [{ provider_id = "p", model = "x", weight = -0.5 }]
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+models:
+  m:
+    providers:
+      - provider_id: "p"
+        model_id: "x"
+        weight: -0.5
 `,
 			want: "positive number",
 		},
 		{
 			name: "partial weights",
-			content: `[[providers]]
-id = "p"
-base_url = "https://x"
-[[providers]]
-id = "q"
-base_url = "https://y"
-[[models]]
-id = "m"
-providers = [
-  { provider_id = "p", model = "x", weight = 0.5 },
-  { provider_id = "q", model = "y" },
-]
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+  q:
+    base_url:
+      openai: "https://y"
+models:
+  m:
+    providers:
+      - provider_id: "p"
+        model_id: "x"
+        weight: 0.5
+      - provider_id: "q"
+        model_id: "y"
 `,
 			want: "weight for every provider",
 		},
 		{
 			name: "weights not one",
-			content: `[[providers]]
-id = "p"
-base_url = "https://x"
-[[providers]]
-id = "q"
-base_url = "https://y"
-[[models]]
-id = "m"
-providers = [
-  { provider_id = "p", model = "x", weight = 0.4 },
-  { provider_id = "q", model = "y", weight = 0.4 },
-]
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+  q:
+    base_url:
+      openai: "https://y"
+models:
+  m:
+    providers:
+      - provider_id: "p"
+        model_id: "x"
+        weight: 0.4
+      - provider_id: "q"
+        model_id: "y"
+        weight: 0.4
 `,
 			want: "sum to 1.0",
 		},
 		{
 			name: "duplicate api key",
-			content: `[[users]]
-id = "a"
-api_key = "k"
-[[users]]
-id = "b"
-api_key = "k"
+			content: `
+users:
+  a:
+    api_key: "k"
+  b:
+    api_key: "k"
 `,
 			want: "duplicate api_key",
 		},
 		{
 			name: "unknown allowed model",
-			content: `[[users]]
-id = "a"
-api_key = "k"
-allowed_models = ["missing"]
+			content: `
+users:
+  a:
+    api_key: "k"
+    allowed_models: ["missing"]
 `,
 			want: "unknown models",
 		},
 		{
-			name:    "bad port",
-			content: "[server]\nport = 70000\n",
-			want:    "server.port",
+			name: "bad port",
+			content: `
+server:
+  port: 70000
+`,
+			want: "server.port",
 		},
 		{
-			name:    "zero port",
-			content: "[server]\nport = 0\n",
-			want:    "server.port",
+			name: "zero port",
+			content: `
+server:
+  port: 0
+`,
+			want: "server.port",
 		},
 		{
-			name:    "unsupported base url",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"ftp://example.test\"\n",
-			want:    "base_url must be an http(s) URL",
+			name: "unsupported base url",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "ftp://example.test"
+`,
+			want: "base_url.openai must be an http(s) URL",
 		},
 		{
-			name:    "timeout overflow",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\ntimeout = 1e300\n",
-			want:    "timeout is too large",
+			name: "timeout overflow",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    timeout: 1e300
+`,
+			want: "timeout is too large",
 		},
 		{
-			name:    "timeout above duration range",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\ntimeout = 9223372037\n",
-			want:    "timeout is too large",
+			name: "timeout above duration range",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    timeout: 9223372037
+`,
+			want: "timeout is too large",
 		},
 		{
-			name:    "unknown key",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\nprotcol = \"openai\"\n",
-			want:    "unknown configuration keys",
-		},
-		{
-			name:    "duplicate model",
-			content: "[[providers]]\nid = \"p\"\nbase_url = \"https://x\"\n[[models]]\nid = \"m\"\nproviders = [{ provider_id = \"p\", model = \"x\" }]\n[[models]]\nid = \"m\"\nproviders = [{ provider_id = \"p\", model = \"x\" }]\n",
-			want:    "duplicate model",
+			name: "unknown key",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    protcol: "openai"
+`,
+			want: "unknown configuration keys",
 		},
 	}
 
@@ -357,8 +799,63 @@ allowed_models = ["missing"]
 func TestLoadConfigMissingFile(t *testing.T) {
 	t.Parallel()
 
-	if _, err := LoadConfig(filepath.Join(t.TempDir(), "missing.toml")); err == nil {
+	if _, err := LoadConfig(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
 		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestLoadConfigEmptyFile(t *testing.T) {
+	t.Parallel()
+
+	for name, content := range map[string]string{
+		"empty":        "",
+		"whitespace":   "  \n\t\n",
+		"comment only": "# nothing here\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadConfig(writeConfig(t, content))
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if strings.Contains(err.Error(), "invalid YAML") {
+				t.Fatalf("empty config must not be reported as a YAML error: %v", err)
+			}
+			if !strings.Contains(err.Error(), "empty") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadConfigRejectsMultipleDocuments(t *testing.T) {
+	t.Parallel()
+
+	_, err := LoadConfig(writeConfig(t, `
+server:
+  port: 5000
+---
+server:
+  port: 6000
+`))
+	if err == nil || !strings.Contains(err.Error(), "single YAML document") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadConfigUnknownKeysAreSorted(t *testing.T) {
+	t.Parallel()
+
+	_, err := LoadConfig(writeConfig(t, `
+server:
+  zebra: 1
+  alpha: 2
+`))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "unknown configuration keys") ||
+		strings.Index(err.Error(), "alpha") > strings.Index(err.Error(), "zebra") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -366,10 +863,11 @@ func TestLoadConfigAcceptsSocksProxy(t *testing.T) {
 	t.Parallel()
 
 	_, err := LoadConfig(writeConfig(t, `
-[[providers]]
-id = "p"
-base_url = "https://x"
-proxy = "socks5://user:pass@127.0.0.1:1080"
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    proxy: "socks5://user:pass@127.0.0.1:1080"
 `))
 	if err != nil {
 		t.Fatalf("socks5 proxy rejected: %v", err)
@@ -379,42 +877,51 @@ proxy = "socks5://user:pass@127.0.0.1:1080"
 func TestOutboundFor(t *testing.T) {
 	t.Parallel()
 
-	provider := &Provider{Protocol: ProtocolOpenAI, Endpoints: []string{"/chat/completions", "/responses"}}
+	provider := &Provider{
+		BaseURLs: map[ProviderProtocol]string{
+			ProtocolOpenAI:    "https://openai.test",
+			ProtocolAnthropic: "https://anthropic.test",
+		},
+		Endpoints: map[ProviderProtocol][]ProviderEndpoint{
+			ProtocolOpenAI: {
+				{Name: "chat_completions", Path: "/chat/completions", Wire: wireOpenAI},
+				{Name: "responses", Path: "/responses", Wire: wireResponses},
+			},
+			ProtocolAnthropic: {
+				{Name: "messages", Path: "/messages", Wire: wireAnthropic},
+			},
+		},
+	}
 
 	cases := []struct {
 		name       string
-		operation  string
 		preferred  WireFormat
+		protocols  []ProviderProtocol
 		wantPath   string
 		wantFormat WireFormat
-		ok         bool
+		wantProto  ProviderProtocol
 	}{
-		{"chat prefers chat", "chat", "openai", "/chat/completions", "openai", true},
-		{"responses prefers responses", "responses", "responses", "/responses", "responses", true},
-		{"fallback to first", "chat", "anthropic", "/chat/completions", "openai", true},
-		{"embeddings unsupported", "embeddings", "", "", "", false},
+		{"openai preferred", "openai", nil, "/chat/completions", "openai", ProtocolOpenAI},
+		{"responses preferred", "responses", nil, "/responses", "responses", ProtocolOpenAI},
+		{"anthropic preferred", "anthropic", nil, "/messages", "anthropic", ProtocolAnthropic},
+		{"openai-only fallback", "anthropic", []ProviderProtocol{ProtocolOpenAI}, "/chat/completions", "openai", ProtocolOpenAI},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			endpoint, format, ok := provider.OutboundFor(test.operation, test.preferred)
-			if ok != test.ok || endpoint != test.wantPath || format != test.wantFormat {
-				t.Fatalf("OutboundFor = %q, %q, %v", endpoint, format, ok)
+			endpoint, protocol, ok := provider.OutboundFor(test.preferred, test.protocols...)
+			if !ok || endpoint.Path != test.wantPath || endpoint.Wire != test.wantFormat || protocol != test.wantProto {
+				t.Fatalf("OutboundFor = %+v, %q, %v", endpoint, protocol, ok)
 			}
 		})
-	}
-
-	anthropic := &Provider{Protocol: ProtocolAnthropic, Endpoints: []string{"/messages"}}
-	if endpoint, format, ok := anthropic.OutboundFor("chat", ""); !ok || endpoint != "/messages" || format != "anthropic" {
-		t.Fatalf("anthropic outbound = %q, %q, %v", endpoint, format, ok)
 	}
 }
 
 func TestRepositoryConfigLoads(t *testing.T) {
 	t.Parallel()
 
-	path := "config.toml"
+	path := "config.yaml"
 	if _, err := os.Stat(path); err != nil {
-		path = "config.example.toml"
+		path = "config.example.yaml"
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Skip("no configuration file present")
@@ -426,16 +933,31 @@ func TestRepositoryConfigLoads(t *testing.T) {
 	if len(cfg.Providers) == 0 || len(cfg.Models) == 0 {
 		t.Fatalf("unexpected config contents: %+v", cfg)
 	}
+
+	if path != "config.example.yaml" {
+		return
+	}
+	overridden, err := LoadConfigWith(path, Overrides{Host: "127.0.0.1", Port: 4100, LogLevel: "debug"})
+	if err != nil {
+		t.Fatalf("load with overrides: %v", err)
+	}
+	if overridden.Host != "127.0.0.1" || overridden.Port != 4100 || overridden.LogLevel != "debug" {
+		t.Fatalf("overrides not applied: %+v", overridden)
+	}
+	if cfg.Port != 4000 || cfg.LogLevel != "info" {
+		t.Fatalf("base config changed: %+v", cfg)
+	}
 }
 
 func TestLoadConfigAcceptsLargestSafeTimeout(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := LoadConfig(writeConfig(t, `
-[[providers]]
-id = "p"
-base_url = "https://x"
-timeout = 9223372036
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+    timeout: 9223372036
 `))
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -453,29 +975,5 @@ func TestLoadConfigWithRejectsInvalidPortOverride(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "port") {
 			t.Fatalf("port %d: error = %v", port, err)
 		}
-	}
-}
-
-func TestLoadConfigWithOverrides(t *testing.T) {
-	t.Parallel()
-
-	path := "config.example.toml"
-	if _, err := os.Stat(path); err != nil {
-		t.Skip("config.example.toml not present")
-	}
-	cfg, err := LoadConfigWith(path, Overrides{Host: "127.0.0.1", Port: 4100, LogLevel: "debug"})
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if cfg.Host != "127.0.0.1" || cfg.Port != 4100 || cfg.LogLevel != "debug" {
-		t.Fatalf("overrides not applied: %+v", cfg)
-	}
-
-	base, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if base.Port != 4000 || base.LogLevel != "info" {
-		t.Fatalf("base config changed: %+v", base)
 	}
 }

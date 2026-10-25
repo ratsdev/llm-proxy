@@ -6,8 +6,8 @@
 coverage.out
 
 # Local configuration with secrets
-config.toml
-config.local.toml
+config.yaml
+config.local.yaml
 .env
 .env.*
 !.env.example

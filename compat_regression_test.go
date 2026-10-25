@@ -28,7 +28,7 @@ func TestCompatRetriesOverloaded529(t *testing.T) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 
-	busyProvider := testProvider("p1", busy.URL, ProtocolAnthropic, "/messages")
+	busyProvider := testProvider("p1", busy.URL, ProtocolAnthropic, "/v1/messages")
 	busyProvider.MaxRetries = 0
 	liveProvider := testProvider("p2", live.URL, ProtocolOpenAI, "/chat/completions")
 	model := &Model{ID: "m", Providers: []ModelProvider{
@@ -43,7 +43,7 @@ func TestCompatRetriesOverloaded529(t *testing.T) {
 	}
 	defer router.Close()
 
-	result, err := send(router, t.Context(), model, "chat", textRequest("hi"), nil, "", "openai")
+	result, err := send(router, t.Context(), model, textRequest("hi"), nil, "", "openai")
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestCompatForwardsRetryAfter(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return &RouteResult{
 				ProviderID:    "provider",
 				UpstreamModel: "model-a",
@@ -89,7 +89,7 @@ func TestCompatStreamingUpstreamJSONBody(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return staticResult(model, http.StatusOK, `{
 				"id":"chatcmpl-up","model":"model-a","created":7,
 				"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
@@ -110,21 +110,6 @@ func TestCompatStreamingUpstreamJSONBody(t *testing.T) {
 	}
 }
 
-// Embeddings never produce SSE. A stray "stream": true must not turn a JSON
-// body into a text/event-stream response.
-func TestCompatEmbeddingsStreamKeepsJSONContentType(t *testing.T) {
-	t.Parallel()
-
-	router := &fakeRouter{}
-	server := newTestServer(t, router, nil)
-
-	response := doJSON(t, http.MethodPost, server.URL+"/api/v1/embeddings", "key-a",
-		`{"model":"model/a","input":"hi","stream":true}`)
-	if got := response.Header.Get("content-type"); got != "application/json" {
-		t.Fatalf("content-type = %q, want application/json", got)
-	}
-}
-
 // Fields the gateway has no IR representation for must not be lost when the
 // inbound and outbound wire formats are identical; callers rely on
 // system_fingerprint, logprobs and similar passthrough data.
@@ -132,7 +117,7 @@ func TestCompatSameProtocolKeepsResponseExtras(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return staticResult(model, http.StatusOK, `{
 				"id":"chatcmpl-up","object":"chat.completion","model":"model-a","created":7,
 				"system_fingerprint":"fp_1",
@@ -173,7 +158,7 @@ func TestCompatSameProtocolStreamKeepsUpstreamFields(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	router := &fakeRouter{
-		send: func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+		send: func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 			return &RouteResult{
 				ProviderID:    "provider",
 				UpstreamModel: "model-a",
@@ -244,7 +229,7 @@ func TestCompatSameProtocolKeepsMultipleChoices(t *testing.T) {
 	t.Parallel()
 
 	router := &fakeRouter{}
-	router.send = func(model *Model, operation string, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
+	router.send = func(model *Model, request *ir.Request, stickyID, inboundProtocol string) (*RouteResult, error) {
 		n, ok := util.AsInt(router.lastPayload["n"])
 		if !ok || n != 2 {
 			t.Errorf("n not forwarded: %+v", router.lastPayload)

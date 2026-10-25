@@ -221,6 +221,10 @@
     }
   }
 
+  function entityLabel(entity) {
+    return (entity && entity.name) || (entity && entity.id) || "unknown";
+  }
+
   
 
   function modalityLabel(value) {
@@ -238,18 +242,24 @@
     }
   }
 
-  function proxyLabel(value) {
-    switch (String(value || "").toLowerCase()) {
-      case "socks5":
-      case "socks5h":
-        return "SOCKS5";
-      case "https":
-        return "HTTPS";
-      case "http":
-        return "HTTP";
-      default:
-        return "Proxy";
-    }
+  // modalityFlow renders the "input → output" modality pair used by model rows
+  // and cards, mirroring the OpenRouter listing style.
+  function modalityFlow(modalities, outputModalities) {
+    const inputs = modalities && modalities.length ? modalities : ["text"];
+    const outputs = outputModalities && outputModalities.length ? outputModalities : ["text"];
+    return el("span", { class: "modality-flow" }, [
+      el(
+        "span",
+        { class: "row-chips" },
+        inputs.map((item) => chip(modalityLabel(item)))
+      ),
+      el("span", { class: "modality-arrow", "aria-hidden": "true", text: "→" }),
+      el(
+        "span",
+        { class: "row-chips" },
+        outputs.map((item) => chip(modalityLabel(item), "subtle"))
+      ),
+    ]);
   }
 
   function formatNumber(value) {
@@ -312,7 +322,7 @@
     return copied;
   }
 
-  async function copyModelName(value, button) {
+  async function copyModelID(value, button) {
     const copied = await copyText(value);
     if (!copied) return;
     button.classList.add("copied");
@@ -321,8 +331,8 @@
     button.replaceChildren(icon("check"));
     setTimeout(() => {
       button.classList.remove("copied");
-      button.title = "Copy model name";
-      button.setAttribute("aria-label", "Copy model name");
+      button.title = "Copy model ID";
+      button.setAttribute("aria-label", "Copy model ID");
       button.replaceChildren(icon("copy"));
     }, 1400);
   }
@@ -421,10 +431,6 @@
       el("span", { class: "meta-label", text: label }),
       el("strong", { class: "meta-value", text: value }),
     ]);
-  }
-
-  function kvRow(label, value) {
-    return el("div", { class: "kv" }, [el("span", { text: label }), value]);
   }
 
   function chip(label, tone) {
@@ -568,9 +574,9 @@
 
     const user = state.session.user || {};
     const userChip = el("a", { class: "user-chip", href: "#/account" }, [
-      el("span", { class: "avatar", text: initials(user.id) }),
+      el("span", { class: "avatar", text: initials(entityLabel(user)) }),
       el("span", { class: "user-meta" }, [
-        el("span", { class: "user-name", text: user.id || "unknown" }),
+        el("span", { class: "user-name", text: entityLabel(user) }),
         el("span", { class: "user-role", text: user.unrestricted ? "Full access" : "Limited access" }),
       ]),
     ]);
@@ -613,9 +619,9 @@
       el("div", { class: "sidebar-spacer" }),
       el("div", { class: "sidebar-footer" }, [
         el("div", { class: "account-mini" }, [
-          el("span", { class: "avatar", text: initials(user.id) }),
+          el("span", { class: "avatar", text: initials(entityLabel(user)) }),
           el("span", { class: "user-meta" }, [
-            el("span", { class: "user-name", text: user.id || "unknown" }),
+            el("span", { class: "user-name", text: entityLabel(user) }),
             el("span", { class: "user-role", text: "API key" }),
           ]),
         ]),
@@ -874,13 +880,15 @@
           ])
         );
       }
-      cells.push(el("td", {}, el("span", { class: "mono ellipsis", title: record.model, text: record.model || "—" })));
+      cells.push(
+        el("td", {}, el("span", { class: "mono ellipsis", title: record.model, text: record.model_name || record.model || "—" }))
+      );
       cells.push(
         el("td", {}, [
           el("span", {
             class: "mono ellipsis",
-            title: record.upstream_model ? "Upstream: " + record.upstream_model : "",
-            text: record.provider || "—",
+            title: "Provider: " + (record.provider || "—") + (record.upstream_model ? " · Upstream: " + record.upstream_model : ""),
+            text: record.provider_name || record.provider || "—",
           }),
         ])
       );
@@ -931,7 +939,7 @@
 
   // ---------------------------------------------------------------- models
 
-  function searchableCards(options) {
+  function searchableList(options) {
     const search = el("input", {
       class: "input search",
       type: "search",
@@ -940,20 +948,29 @@
       "aria-label": options.placeholder,
     });
     const note = el("span", { class: "toolbar-note", "aria-live": "polite" });
-    const grid = el("div", { class: "card-grid" });
+    const host = el("div");
 
     function render() {
       const term = state[options.filterKey].trim().toLowerCase();
       const filtered = options.items.filter((item) => options.match(item, term));
       note.textContent = countLabel(filtered.length, options.items.length, options.noun);
-      grid.replaceChildren(
-        ...(filtered.length
-          ? filtered.map(options.renderCard)
-          : [
-              options.items.length === 0
-                ? emptyState(options.emptyTitle, options.emptyText)
-                : emptyState("No " + options.noun + "s match your search", "Try a different search term."),
-            ])
+      if (!filtered.length) {
+        host.replaceChildren(
+          options.items.length === 0
+            ? emptyState(options.emptyTitle, options.emptyText)
+            : emptyState("No " + options.noun + "s match your search", "Try a different search term.")
+        );
+        return;
+      }
+      host.replaceChildren(
+        el("div", { class: "list" }, [
+          el(
+            "div",
+            { class: "list-head " + options.rowClass },
+            options.columns.map((column) => el("span", { text: column }))
+          ),
+          ...filtered.map(options.renderRow),
+        ])
       );
     }
 
@@ -964,140 +981,166 @@
     render();
 
     return el("div", { class: "stack" }, [
-      el("div", { class: "toolbar" }, [el("div", { class: "search-wrap" }, [icon("search"), search]), note]),
-      grid,
+      el("div", { class: "toolbar" }, [
+        el("div", { class: "search-wrap" }, [icon("search"), search]),
+        note,
+      ]),
+      host,
     ]);
   }
 
   function modelsView(data) {
-    return searchableCards({
+    return searchableList({
       items: data.models || [],
       filterKey: "modelFilter",
       placeholder: "Search models",
       noun: "model",
       match: matchesModel,
-      renderCard: modelCard,
+      renderRow: modelRow,
+      rowClass: "model-row",
+      columns: ["Model", "Modalities", "Context", "Max output", "Providers"],
       emptyTitle: "No models available",
       emptyText: "Your account doesn't have access to any models.",
     });
   }
 
   function matchesModel(model, term) {
-    const parts = [model.id, ...(model.modalities || [])];
+    const parts = [model.id, model.name, ...(model.modalities || []), ...(model.output_modalities || [])];
     (model.providers || []).forEach((provider) => {
-      parts.push(provider.id, provider.upstream_model, provider.protocol);
+      parts.push(provider.id, provider.name, provider.upstream_model, ...(provider.protocols || []));
     });
     return matchesQuery(parts, term);
   }
 
-  function modelCard(model) {
-    const providers = model.providers || [];
-    const totalWeight = providers.reduce((sum, provider) => sum + (Number(provider.weight) || 0), 0) || 1;
-    const modalities = (model.modalities && model.modalities.length ? model.modalities : ["text"]).map((item) =>
-      chip(modalityLabel(item))
-    );
-
-    const copyButton = el(
+  function modelCopyButton(model) {
+    const button = el(
       "button",
       {
         class: "copy-btn",
         type: "button",
-        title: "Copy model name",
-        "aria-label": "Copy model name",
-        on: { click: () => copyModelName(model.id, copyButton) },
+        title: "Copy model ID",
+        "aria-label": "Copy model ID",
+        on: { click: () => copyModelID(model.id, button) },
       },
       [icon("copy")]
     );
+    return button;
+  }
 
-    return el("article", { class: "card model-card" }, [
-      el("div", { class: "model-head" }, [
-        el("div", { class: "model-title" }, [el("h3", { class: "mono", title: model.id, text: model.id }), copyButton]),
-        el("div", { class: "row-chips" }, modalities),
+  function modelRow(model) {
+    const providers = model.providers || [];
+    const name = entityLabel(model);
+    const providerNames = providers.map(entityLabel).join(", ");
+    return el("article", { class: "list-row model-row" }, [
+      el("div", { class: "list-identity" }, [
+        el("div", { class: "list-title" }, [
+          el("h3", { class: "model-name", title: name, text: name }),
+          modelCopyButton(model),
+        ]),
+        name !== model.id ? el("span", { class: "list-sub mono", title: model.id, text: model.id }) : null,
       ]),
-      el("div", { class: "meta-grid" }, [
-        metaCell("Context", model.context_length ? formatSize(model.context_length) : "—"),
-        metaCell("Max output", model.max_output_length ? formatSize(model.max_output_length) : "—"),
-        metaCell("Timeout", model.timeout ? model.timeout + "s" : "Default"),
+      el("div", { class: "list-field list-modalities" }, [
+        el("span", { class: "list-label", text: "Modalities" }),
+        modalityFlow(model.modalities, model.output_modalities),
       ]),
-      el(
-        "div",
-        { class: "routes" },
-        providers.map((provider) => {
-          const percent = Math.round(((Number(provider.weight) || 0) / totalWeight) * 100);
-          return el("div", { class: "route" }, [
-            el("span", { class: "route-provider mono", text: provider.id }),
-            el("span", { class: "route-arrow", text: "→" }),
-            el("span", {
-              class: "route-upstream mono",
-              title: "Upstream model",
-              text: provider.upstream_model,
-            }),
-            chip(percent + "%"),
-            provider.protocol ? chip(protocolLabel(provider.protocol), "subtle") : null,
-          ]);
-        })
-      ),
+      el("div", { class: "list-field" }, [
+        el("span", { class: "list-label", text: "Context" }),
+        el("span", { class: "list-value", text: model.context_length ? formatSize(model.context_length) : "—" }),
+      ]),
+      el("div", { class: "list-field" }, [
+        el("span", { class: "list-label", text: "Max output" }),
+        el("span", { class: "list-value", text: model.max_output_length ? formatSize(model.max_output_length) : "—" }),
+      ]),
+      el("div", { class: "list-field list-providers" }, [
+        el("span", { class: "list-label", text: "Providers" }),
+        el("span", {
+          class: "list-value list-ellipsis",
+          title: providerNames || "—",
+          text: providerNames || "—",
+        }),
+      ]),
     ]);
   }
 
   // ------------------------------------------------------------- providers
 
   function providersView(data) {
-    return searchableCards({
+    return searchableList({
       items: data.providers || [],
       filterKey: "providerFilter",
       placeholder: "Search providers",
       noun: "provider",
       match: matchesProvider,
-      renderCard: providerCard,
+      renderRow: providerRow,
+      rowClass: "provider-row",
+      columns: ["Provider", "Base URL", "Models", "Retries"],
       emptyTitle: "No providers available",
       emptyText: "No upstream services are connected to your models.",
     });
   }
 
   function matchesProvider(provider, term) {
+    const baseURLs = Object.values(provider.base_urls || {});
+    const endpoints = Object.values(provider.endpoints || {}).flatMap((byOperation) => Object.values(byOperation || {}));
     return matchesQuery(
-      [provider.id, provider.protocol, provider.base_url, ...(provider.endpoints || []), ...(provider.models || [])],
+      [
+        provider.id,
+        provider.name,
+        ...(provider.protocols || []),
+        ...baseURLs,
+        ...endpoints,
+        ...(provider.models || []),
+        ...Object.values(provider.model_names || {}),
+      ],
       term
     );
   }
 
-  function providerCard(provider) {
-    const rows = [
-      kvRow("Base URL", el("code", { class: "mono", text: provider.base_url })),
-      kvRow(
-        "Endpoints",
-        el(
-          "div",
-          { class: "row-chips" },
-          (provider.endpoints || []).map((endpoint) => chip(endpoint, "mono"))
-        )
-      ),
-      kvRow(
-        "Models",
-        (provider.models || []).length
-          ? el("div", { class: "row-chips" }, provider.models.map((model) => chip(model, "mono")))
-          : el("span", { class: "muted", text: "—" })
-      ),
-      kvRow("Retries", el("span", { class: "kv-value", text: String(Number(provider.max_retries) || 0) })),
-      kvRow("Timeout", el("span", { class: "kv-value", text: provider.timeout ? provider.timeout + "s" : "—" })),
-    ];
+  // baseURLField lists each protocol's base URL on its own line, in full, with
+  // the protocol label kept in front so endpoints remain identifiable.
+  function baseURLField(provider) {
+    const baseURLs = Object.entries(provider.base_urls || {}).filter(([, value]) => String(value || "").trim());
+    if (!baseURLs.length) return el("span", { class: "list-value", text: "—" });
+    return el(
+      "span",
+      { class: "list-urls" },
+      baseURLs.map(([protocol, baseURL]) =>
+        el("span", { class: "url-endpoint" }, [
+          el("span", { class: "url-protocol", text: protocolLabel(protocol) }),
+          el("code", { class: "mono url-full", title: baseURL, text: baseURL }),
+        ])
+      )
+    );
+  }
 
-    if (provider.proxy) {
-      rows.push(kvRow("Proxy", el("span", { class: "kv-value", text: proxyLabel(provider.proxy_scheme) })));
-    }
-    if (provider.custom_headers) {
-      rows.push(kvRow("Headers", el("span", { class: "kv-value", text: "Custom" })));
-    }
-
-    return el("article", { class: "card provider-card" }, [
-      el("div", { class: "model-head" }, [
-        el("div", { class: "provider-title" }, [
-          el("h3", { class: "mono", text: provider.id }),
-          chip(protocolLabel(provider.protocol)),
+  function providerRow(provider) {
+    const modelNames = (provider.models || []).map((model) => (provider.model_names || {})[model] || model);
+    return el("article", { class: "list-row provider-row" }, [
+      el("div", { class: "list-identity" }, [
+        el("div", { class: "list-title" }, [
+          el("h3", { class: "provider-name", title: provider.id, text: entityLabel(provider) }),
+        ]),
+        el("div", { class: "list-sub-row" }, [
+          el("span", { class: "list-sub mono", title: provider.id, text: provider.id }),
+          ...(provider.protocols || []).map((protocol) => chip(protocolLabel(protocol))),
         ]),
       ]),
-      el("div", { class: "kv-list" }, rows),
+      el("div", { class: "list-field list-base-url" }, [
+        el("span", { class: "list-label", text: "Base URL" }),
+        baseURLField(provider),
+      ]),
+      el("div", { class: "list-field list-models" }, [
+        el("span", { class: "list-label", text: "Models" }),
+        el("span", {
+          class: "list-value list-ellipsis",
+          title: modelNames.join(", ") || "—",
+          text: modelNames.join(", ") || "—",
+        }),
+      ]),
+      el("div", { class: "list-field" }, [
+        el("span", { class: "list-label", text: "Retries" }),
+        el("span", { class: "list-value", text: String(Number(provider.max_retries) || 0) }),
+      ]),
     ]);
   }
 
@@ -1141,7 +1184,16 @@
         if (state.requestStatus === "success" && Number(record.status) >= 400) return false;
         if (state.requestStatus === "error" && Number(record.status) < 400) return false;
         return matchesQuery(
-          [record.request_id, record.model, record.provider, record.upstream_model, record.status, record.inbound],
+          [
+            record.request_id,
+            record.model,
+            record.model_name,
+            record.provider,
+            record.provider_name,
+            record.upstream_model,
+            record.status,
+            record.inbound,
+          ],
           term
         );
       });
@@ -1194,19 +1246,20 @@
     const user = state.session.user || {};
     const gateway = state.session.gateway || {};
     const allowed = user.allowed_models || [];
+    const modelNames = user.allowed_model_names || {};
 
     const accessChips = user.unrestricted
       ? [chip("All models", "good")]
       : allowed.length
-      ? allowed.map((model) => chip(model, "mono"))
+      ? allowed.map((model) => chip(modelNames[model] || model, "mono"))
       : [chip("No models assigned")];
 
     return el("div", { class: "stack" }, [
       el("section", { class: "card account-card" }, [
         el("div", { class: "account-head" }, [
-          el("span", { class: "avatar xlarge", text: initials(user.id) }),
+          el("span", { class: "avatar xlarge", text: initials(entityLabel(user)) }),
           el("div", {}, [
-            el("h2", { text: user.id || "unknown" }),
+            el("h2", { text: entityLabel(user) }),
             el("p", { class: "muted", text: "Signed in with an API key" }),
           ]),
           el("button", { class: "btn ghost", type: "button", on: { click: logout } }, [
