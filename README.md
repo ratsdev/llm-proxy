@@ -185,6 +185,7 @@ models:
       - provider_id: "openai-prod"
         model_id: "gpt-4.1-mini"
         weight: 0.7
+        max_retry_after: 10               # optional Retry-After cap for this binding (seconds)
       - provider_id: "anthropic-prod"
         model_id: "claude-sonnet-4"
         weight: 0.3
@@ -222,6 +223,7 @@ The map key is the provider ID. When routing a chat request, the preferred proto
 | --- | --- | --- |
 | `providers` | yes | Non-empty list of `{ provider_id, model_id, weight }`. `model_id` is the upstream model name. |
 | `weight` | no | Positive routing weight. Declare weights for all providers or none; declared weights must sum to `1.0`. |
+| `max_retry_after` | no | Per-binding cap in seconds on how long a `Retry-After` header may delay the next retry of the same provider. `0` retries immediately; default `5`. |
 | `name` | no | Human-readable label shown in the Web UI; the model alias is shown when empty. |
 | `context_length` | no | Metadata returned by the models API. |
 | `max_output_length` | no | Default output token budget when a request is converted across formats and does not specify one. |
@@ -360,7 +362,9 @@ For each request the gateway:
 4. Sends the request to each candidate in order, retrying transient failures up to that provider's `max_retries`.
 5. Fails over to the next provider on retryable errors.
 
-Retryable upstream statuses: `408`, `409`, `425`, `429`, `500`, `502`, `503`, `504`, `529` (Anthropic overloaded). Other `4xx` responses are returned to the client immediately. Backoff starts at 250 ms, doubles, and is capped at 2 s; `Retry-After` is honored up to 5 s.
+Retryable upstream statuses: `408`, `409`, `425`, `429`, `500`, `502`, `503`, `504`, `529` (Anthropic overloaded). Other `4xx` responses are returned to the client immediately. Backoff starts at 250 ms, doubles, is capped at 2 s, and adds up to 50% jitter. `Retry-After` is honored in delta-seconds or HTTP-date form, up to the binding's `max_retry_after` (default 5 s).
+
+After a `429`, that provider is deprioritised for the model that hit the limit: later requests for the same model try other candidates first until the cooldown ends. The cooldown uses the upstream `Retry-After`, or 30 s when the header is absent, and is capped at 5 minutes. Cooldown is a preference, not a hard ban, so the provider is still used when every other candidate is unavailable.
 
 **Sticky routing:** if a client sends a valid `x-request-id` (up to 128 characters of `A-Z a-z 0-9 . _ : -`), a successful upstream is remembered for that ID and preferred by later requests with the same ID. The cache is in-memory, bounded to 10,000 entries, and is not shared between replicas. If no `x-request-id` is supplied, the gateway generates one for the response but does not pin the request.
 

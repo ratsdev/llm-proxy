@@ -109,6 +109,9 @@ type ModelProvider struct {
 	ProviderID    string
 	UpstreamModel string
 	Weight        float64
+	// MaxRetryAfter caps the Retry-After wait for this binding in seconds.
+	// Nil uses the gateway default.
+	MaxRetryAfter *float64
 }
 
 // Model is a caller-visible model with its upstream providers.
@@ -213,9 +216,10 @@ type fileModalities struct {
 }
 
 type fileModelProvider struct {
-	ProviderID string   `yaml:"provider_id"`
-	ModelID    string   `yaml:"model_id"`
-	Weight     *float64 `yaml:"weight"`
+	ProviderID    string   `yaml:"provider_id"`
+	ModelID       string   `yaml:"model_id"`
+	Weight        *float64 `yaml:"weight"`
+	MaxRetryAfter *float64 `yaml:"max_retry_after"`
 }
 
 type fileUser struct {
@@ -325,6 +329,8 @@ func decodeConfigError(err error, data []byte) error {
 			return fmt.Errorf("max_retries must be an integer between 0 and %d", maxProviderRetries)
 		case "timeout":
 			return fmt.Errorf("timeout must be a positive number")
+		case "max_retry_after":
+			return fmt.Errorf("max_retry_after must be a non-negative number")
 		case "drop_params":
 			return fmt.Errorf("general.drop_params must be a boolean")
 		case "port":
@@ -596,10 +602,15 @@ func (f fileModelProvider) build(where string) (ModelProvider, bool, error) {
 		}
 		weight = *f.Weight
 	}
+	maxRetryAfter, err := validateMaxRetryAfter(f.MaxRetryAfter, where)
+	if err != nil {
+		return ModelProvider{}, false, err
+	}
 	return ModelProvider{
 		ProviderID:    providerID,
 		UpstreamModel: upstreamModel,
 		Weight:        weight,
+		MaxRetryAfter: maxRetryAfter,
 	}, hasWeight, nil
 }
 
@@ -790,6 +801,21 @@ func validateTimeout(value *float64, where string) (*float64, error) {
 	}
 	if *value > maxTimeoutSeconds {
 		return nil, fmt.Errorf("%s.timeout is too large", where)
+	}
+	return value, nil
+}
+
+// validateMaxRetryAfter validates the per-binding Retry-After cap in seconds.
+// Zero disables waiting, which makes the gateway retry without a pause.
+func validateMaxRetryAfter(value *float64, where string) (*float64, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if !isFinite(*value) || *value < 0 {
+		return nil, fmt.Errorf("%s.max_retry_after must be a non-negative number", where)
+	}
+	if *value > maxTimeoutSeconds {
+		return nil, fmt.Errorf("%s.max_retry_after is too large", where)
 	}
 	return value, nil
 }

@@ -51,6 +51,7 @@ models:
       - provider_id: "p1"
         model_id: "up-a"
         weight: 0.4
+        max_retry_after: 2.5
       - provider_id: "p2"
         model_id: "up-b"
         weight: 0.6
@@ -140,6 +141,12 @@ func TestLoadConfigValid(t *testing.T) {
 	}
 	if len(model.Providers) != 2 || model.Providers[0].Weight != 0.4 || model.Providers[1].UpstreamModel != "up-b" {
 		t.Fatalf("model providers = %+v", model.Providers)
+	}
+	if model.Providers[0].MaxRetryAfter == nil || *model.Providers[0].MaxRetryAfter != 2.5 {
+		t.Fatalf("max_retry_after = %v", model.Providers[0].MaxRetryAfter)
+	}
+	if model.Providers[1].MaxRetryAfter != nil {
+		t.Fatalf("unset max_retry_after = %v", model.Providers[1].MaxRetryAfter)
 	}
 
 	defaultModel := cfg.Models["model/b"]
@@ -657,6 +664,22 @@ models:
         weight: -0.5
 `,
 			want: "positive number",
+		},
+		{
+			name: "negative max_retry_after",
+			content: `
+providers:
+  p:
+    base_url:
+      openai: "https://x"
+models:
+  m:
+    providers:
+      - provider_id: "p"
+        model_id: "x"
+        max_retry_after: -1
+`,
+			want: "max_retry_after must be a non-negative number",
 		},
 		{
 			name: "partial weights",

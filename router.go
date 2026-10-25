@@ -23,10 +23,17 @@ import (
 const (
 	stickyCacheSize         = 10_000
 	defaultAnthropicVersion = "2023-06-01"
-	maxRetryAfter           = 5 * time.Second
-	maxBackoff              = 2 * time.Second
-	maxErrorBodyBytes       = 1 << 20
-	defaultReadTimeout      = 600 * time.Second
+	// defaultMaxRetryAfter bounds how long one provider binding waits for a
+	// Retry-After before retrying. models.*.providers[].max_retry_after
+	// overrides it per binding.
+	defaultMaxRetryAfter = 5 * time.Second
+	maxBackoff           = 2 * time.Second
+	maxErrorBodyBytes    = 1 << 20
+	defaultReadTimeout   = 600 * time.Second
+	// A provider that reports 429 is deprioritised for one model for the
+	// Retry-After interval, or for defaultCooldown when the header is absent.
+	defaultCooldown = 30 * time.Second
+	maxCooldown     = 5 * time.Minute
 	// maxRetryShift keeps the exponential backoff shift well inside int64.
 	maxRetryShift = 10
 )
@@ -91,6 +98,13 @@ type stickyEntry struct {
 	upstreamModel string
 }
 
+// cooldownKey scopes a 429 cooldown to one provider binding of one model, so a
+// rate limit on one model does not penalise the same provider for other models.
+type cooldownKey struct {
+	modelID    string
+	providerID string
+}
+
 // RouteRequest is one dispatch. Payload is the inbound JSON. Same-wire
 // candidates forward Payload after sanitizing the model name; other candidates
 // are translated through the IR. Request is an optional pre-parsed IR (tests
@@ -119,6 +133,7 @@ type Router struct {
 	sticky   map[string]stickyEntry
 	order    *list.List
 	elements map[string]*list.Element
+	cooldown map[cooldownKey]time.Time
 }
 
 // Option customises a Router.
@@ -160,6 +175,7 @@ func NewRouter(cfg *Config, opts ...Option) (*Router, error) {
 		sticky:   make(map[string]stickyEntry),
 		order:    list.New(),
 		elements: make(map[string]*list.Element),
+		cooldown: make(map[cooldownKey]time.Time),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -310,7 +326,7 @@ func (r *Router) dispatch(
 		return nil, err
 	}
 
-	ordered := r.routeOrder(candidates, req.StickyID)
+	ordered := r.routeOrder(candidates, req.StickyID, req.Model.ID)
 	routed := false
 	defer func() {
 		if !routed {
@@ -348,6 +364,9 @@ func (r *Router) dispatch(
 			routed = true
 			return result, nil
 		}
+		if result.Status == http.StatusTooManyRequests {
+			r.startCooldown(req.Model.ID, target.provider.ID, result.Header)
+		}
 		if retryableStatus[result.Status] {
 			failures = append(failures, fmt.Sprintf("%s: HTTP %d", target.provider.ID, result.Status))
 			lastRetryable = result
@@ -382,6 +401,7 @@ func (r *Router) attempt(
 	provider := target.provider
 	headers := upstreamHeaders(provider, target.protocol, req.Stream, req.InboundHeaders)
 	readTimeout := readTimeoutFor(req.Model, provider)
+	maxAfter := maxRetryAfterFor(target.modelProvider)
 	attempts := provider.MaxRetries + 1
 	client := r.clients[provider.Proxy]
 	url := provider.URLFor(target.protocol, target.endpoint)
@@ -395,7 +415,7 @@ func (r *Router) attempt(
 			r.logger.Warn("upstream request failed",
 				"provider", provider.ID, "attempt", attempt+1, "attempts", attempts, "error", err)
 			if attempt+1 < attempts {
-				if err := r.sleep(ctx, retryDelay(attempt, nil)); err != nil {
+				if err := r.sleep(ctx, r.retryDelay(attempt, nil, maxAfter)); err != nil {
 					return nil, err
 				}
 			}
@@ -426,7 +446,7 @@ func (r *Router) attempt(
 			r.logger.Warn("upstream error, retrying",
 				"provider", provider.ID, "status", result.Status,
 				"attempt", attempt+1, "attempts", attempts)
-			if err := r.sleep(ctx, retryDelay(attempt, response.Header)); err != nil {
+			if err := r.sleep(ctx, r.retryDelay(attempt, response.Header, maxAfter)); err != nil {
 				return nil, err
 			}
 			continue
@@ -476,7 +496,7 @@ func (r *Router) sendOnce(
 	return response, nil
 }
 
-func (r *Router) routeOrder(candidates []candidate, requestID string) []candidate {
+func (r *Router) routeOrder(candidates []candidate, requestID, modelID string) []candidate {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -490,7 +510,7 @@ func (r *Router) routeOrder(candidates []candidate, requestID string) []candidat
 					ordered = append(ordered, item)
 					ordered = append(ordered, candidates[:index]...)
 					ordered = append(ordered, candidates[index+1:]...)
-					return ordered
+					return r.demoteCoolingLocked(ordered, modelID, time.Now())
 				}
 			}
 			// The pinned upstream cannot serve this request any more.
@@ -502,7 +522,53 @@ func (r *Router) routeOrder(candidates []candidate, requestID string) []candidat
 	// Sticky state is written only once a provider has actually served the
 	// request, so a tentative pick that is about to fail cannot be observed by
 	// a concurrent request carrying the same id.
-	return ordered
+	return r.demoteCoolingLocked(ordered, modelID, time.Now())
+}
+
+// demoteCoolingLocked moves providers that recently answered 429 for this model
+// to the end of the order. Cooldown is a preference rather than a hard ban, so
+// a request still tries a cooling provider when every other candidate is
+// unavailable. The lock must be held.
+func (r *Router) demoteCoolingLocked(ordered []candidate, modelID string, now time.Time) []candidate {
+	if len(r.cooldown) == 0 || len(ordered) < 2 {
+		return ordered
+	}
+	live := make([]candidate, 0, len(ordered))
+	cooling := make([]candidate, 0, len(ordered))
+	for _, item := range ordered {
+		key := cooldownKey{modelID: modelID, providerID: item.provider.ID}
+		if until, ok := r.cooldown[key]; ok {
+			if now.Before(until) {
+				cooling = append(cooling, item)
+				continue
+			}
+			delete(r.cooldown, key)
+		}
+		live = append(live, item)
+	}
+	if len(cooling) == 0 {
+		return ordered
+	}
+	return append(live, cooling...)
+}
+
+// startCooldown deprioritises a provider for one model after it reports 429.
+// The cooldown follows Retry-After, defaults to 30 s, and is capped at 5 min.
+func (r *Router) startCooldown(modelID, providerID string, header http.Header) {
+	now := time.Now()
+	delay, ok := parseRetryAfter(header, now)
+	switch {
+	case !ok:
+		delay = defaultCooldown
+	case delay > maxCooldown:
+		delay = maxCooldown
+	}
+	if delay <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cooldown[cooldownKey{modelID: modelID, providerID: providerID}] = now.Add(delay)
 }
 
 func (r *Router) weightedOrderLocked(candidates []candidate) []candidate {
@@ -632,27 +698,59 @@ func readTimeoutFor(model *Model, provider *Provider) time.Duration {
 	}
 }
 
-func retryDelay(attempt int, header http.Header) time.Duration {
-	if header != nil {
-		retryAfter := strings.TrimSpace(header.Get("Retry-After"))
-		if retryAfter != "" && isDigits(retryAfter) {
-			if seconds, err := strconv.Atoi(retryAfter); err == nil {
-				delay := time.Duration(seconds) * time.Second
-				if delay > maxRetryAfter {
-					return maxRetryAfter
-				}
-				return delay
-			}
+// maxRetryAfterFor reports how long one model provider binding may wait for a
+// Retry-After before retrying the same upstream.
+func maxRetryAfterFor(modelProvider ModelProvider) time.Duration {
+	if modelProvider.MaxRetryAfter == nil {
+		return defaultMaxRetryAfter
+	}
+	return time.Duration(*modelProvider.MaxRetryAfter * float64(time.Second))
+}
+
+// retryDelay computes the wait before the next attempt to the same provider.
+// Retry-After takes precedence and is clamped to the binding's max_retry_after.
+// Otherwise the delay is the usual exponential backoff, capped at 2 s, plus up
+// to 50% jitter so clients that failed together do not retry together.
+func (r *Router) retryDelay(attempt int, header http.Header, maxAfter time.Duration) time.Duration {
+	now := time.Now()
+	if delay, ok := parseRetryAfter(header, now); ok {
+		if delay > maxAfter {
+			return maxAfter
 		}
+		return delay
 	}
 	if attempt > maxRetryShift {
 		attempt = maxRetryShift
 	}
-	delay := 250 * time.Millisecond << attempt
-	if delay > maxBackoff {
-		return maxBackoff
+	base := 250 * time.Millisecond << attempt
+	if base > maxBackoff {
+		base = maxBackoff
 	}
-	return delay
+	return base + time.Duration(float64(base/2)*r.rand())
+}
+
+// parseRetryAfter reads a Retry-After header in either delta-seconds or
+// HTTP-date form. A date in the past parses as a zero delay.
+func parseRetryAfter(header http.Header, now time.Time) (time.Duration, bool) {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		return 0, false
+	}
+	if isDigits(value) {
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	if delay := when.Sub(now); delay > 0 {
+		return delay, true
+	}
+	return 0, true
 }
 
 func isDigits(value string) bool {

@@ -838,8 +838,90 @@ func readAll(t *testing.T, request *http.Request) []byte {
 func TestRetryDelayClampsHugeAttempt(t *testing.T) {
 	t.Parallel()
 
-	if got := retryDelay(1000, nil); got != maxBackoff {
-		t.Fatalf("retryDelay = %v, want %v", got, maxBackoff)
+	router := &Router{rand: func() float64 { return 1 }}
+	if got := router.retryDelay(1000, nil, defaultMaxRetryAfter); got != maxBackoff+maxBackoff/2 {
+		t.Fatalf("retryDelay = %v, want %v", got, maxBackoff+maxBackoff/2)
+	}
+}
+
+func TestRetryDelayAddsJitter(t *testing.T) {
+	t.Parallel()
+
+	low := &Router{rand: func() float64 { return 0 }}
+	if got := low.retryDelay(0, nil, defaultMaxRetryAfter); got != 250*time.Millisecond {
+		t.Fatalf("low jitter delay = %v, want 250ms", got)
+	}
+	high := &Router{rand: func() float64 { return 1 }}
+	if got := high.retryDelay(0, nil, defaultMaxRetryAfter); got != 375*time.Millisecond {
+		t.Fatalf("high jitter delay = %v, want 375ms", got)
+	}
+}
+
+func TestRetryDelayClampsRetryAfterToBindingCap(t *testing.T) {
+	t.Parallel()
+
+	router := &Router{rand: func() float64 { return 0 }}
+	header := http.Header{"Retry-After": []string{"30"}}
+	if got := router.retryDelay(0, header, 2*time.Second); got != 2*time.Second {
+		t.Fatalf("retryDelay = %v, want 2s", got)
+	}
+}
+
+func TestParseRetryAfterHTTPDate(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	header := http.Header{"Retry-After": []string{now.Add(3 * time.Second).Format(http.TimeFormat)}}
+	delay, ok := parseRetryAfter(header, now)
+	if !ok || delay != 3*time.Second {
+		t.Fatalf("date delay = %v, ok = %v, want 3s", delay, ok)
+	}
+
+	past := http.Header{"Retry-After": []string{now.Add(-time.Second).Format(http.TimeFormat)}}
+	if delay, ok := parseRetryAfter(past, now); !ok || delay != 0 {
+		t.Fatalf("past date delay = %v, ok = %v, want 0", delay, ok)
+	}
+
+	invalid := http.Header{"Retry-After": []string{"soon"}}
+	if _, ok := parseRetryAfter(invalid, now); ok {
+		t.Fatal("invalid Retry-After should not parse")
+	}
+}
+
+func TestRouterCoolsDownRateLimitedProvider(t *testing.T) {
+	t.Parallel()
+
+	var limited atomic.Int32
+	limitedServer := upstream(t, func(w http.ResponseWriter, r *http.Request) {
+		limited.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	liveServer := upstream(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	p1 := testProvider("p1", limitedServer.URL, ProtocolOpenAI, "/chat/completions")
+	p1.MaxRetries = 0
+	p2 := testProvider("p2", liveServer.URL, ProtocolOpenAI, "/chat/completions")
+	model := &Model{ID: "m", Providers: []ModelProvider{
+		{ProviderID: "p1", UpstreamModel: "u1", Weight: 1},
+		{ProviderID: "p2", UpstreamModel: "u2", Weight: 1},
+	}}
+
+	router, _ := NewRouter(testConfig([]*Provider{p1, p2}, model),
+		WithRand(func() float64 { return 0 }), WithSleep(noSleep))
+	defer router.Close()
+
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := send(router, t.Context(), model, textRequest("hi"), nil, "", "openai")
+		if err != nil {
+			t.Fatalf("send %d: %v", attempt, err)
+		}
+		if result.ProviderID != "p2" {
+			t.Fatalf("send %d provider = %q", attempt, result.ProviderID)
+		}
+		_ = result.Close()
+	}
+	if got := limited.Load(); got != 1 {
+		t.Fatalf("rate-limited provider attempts = %d, want 1", got)
 	}
 }
 
