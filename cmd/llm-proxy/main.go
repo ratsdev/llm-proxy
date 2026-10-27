@@ -19,6 +19,14 @@ import (
 	llmproxy "github.com/ratsdev/llm-proxy"
 )
 
+const (
+	defaultListenPort = 4000
+	// readTimeout bounds reading one request, including its body. Streaming
+	// replies are unaffected: the deadline covers the inbound request only, and
+	// it keeps a client from trickling a 64 MiB body indefinitely.
+	readTimeout = 2 * time.Minute
+)
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -28,70 +36,83 @@ func run(args []string) int {
 	flags.SetOutput(os.Stderr)
 
 	var (
-		configPath  string
+		dbPath      string
 		host        string
 		port        int
 		logLevel    string
 		showVersion bool
 	)
-	flags.StringVar(&configPath, "config", "", "path to the YAML configuration file")
-	flags.StringVar(&configPath, "c", "", "path to the YAML configuration file (shorthand)")
-	flags.StringVar(&host, "host", "", "listen address (overrides server.host)")
-	flags.IntVar(&port, "port", 0, "listen port (overrides server.port)")
-	flags.StringVar(&logLevel, "log-level", "", "log level: debug, info, warning, error")
+	flags.StringVar(&dbPath, "db", envOr("LLM_PROXY_DB", llmproxy.DefaultDatabasePath),
+		"path to the SQLite database (created on first start)")
+	flags.StringVar(&host, "host", envOr("LLM_PROXY_HOST", "0.0.0.0"), "listen address")
+	flags.IntVar(&port, "port", envIntOr("LLM_PROXY_PORT", defaultListenPort), "listen port")
+	flags.StringVar(&logLevel, "log-level", envOr("LLM_PROXY_LOG_LEVEL", "info"),
+		"log level: debug, info, warning, error")
 	flags.BoolVar(&showVersion, "version", false, "print the version and exit")
 
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	if showVersion {
 		fmt.Printf("llm-proxy %s\n", llmproxy.Version)
 		return 0
 	}
-	if strings.TrimSpace(configPath) == "" {
-		fmt.Fprintln(os.Stderr, "llm-proxy: --config is required")
-		flags.Usage()
-		return 2
-	}
-
-	cfg, err := llmproxy.LoadConfigWith(configPath, llmproxy.Overrides{
-		Host:     host,
-		Port:     port,
-		LogLevel: logLevel,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "llm-proxy: %v\n", err)
+	if port < 1 || port > 65535 {
+		fmt.Fprintln(os.Stderr, "llm-proxy: --port must be between 1 and 65535")
 		return 2
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: parseLevel(cfg.LogLevel),
+		Level: parseLevel(logLevel),
 	}))
 	slog.SetDefault(logger)
 
-	router, err := llmproxy.NewRouter(cfg, llmproxy.WithLogger(logger))
+	store, err := llmproxy.OpenStore(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "llm-proxy: %v\n", err)
 		return 2
 	}
-	defer router.Close()
+	defer func() { _ = store.Close() }()
 
-	address := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	server := llmproxy.NewServer(cfg, router, logger)
+	initialized, err := store.HasAdmin()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "llm-proxy: %v\n", err)
+		return 2
+	}
+	if !initialized {
+		logger.Warn("no administrator account exists",
+			"note", "open the Web console to register the first administrator account")
+	}
+
+	app, err := llmproxy.NewApp(store, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "llm-proxy: %v\n", err)
+		return 2
+	}
+	defer app.Close()
+
+	address := net.JoinHostPort(host, strconv.Itoa(port))
 	httpServer := &http.Server{
 		Addr:              address,
-		Handler:           server.Handler(),
+		Handler:           app,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       readTimeout,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
 
+	cfg := app.Config()
 	logger.Info("starting llm-proxy",
 		"version", llmproxy.Version,
 		"address", address,
+		"database", store.Path(),
 		"providers", len(cfg.Providers),
 		"models", len(cfg.Models),
-		"users", len(cfg.UsersByKey))
+		"api_keys", len(cfg.UsersByKey),
+		"ui", "http://"+address+"/")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -100,6 +121,27 @@ func run(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func envOr(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envIntOr(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		// Silently falling back would hide a typo in a deployment manifest.
+		fmt.Fprintf(os.Stderr, "llm-proxy: ignoring invalid %s=%q, using %d\n", key, raw, fallback)
+		return fallback
+	}
+	return value
 }
 
 // serve runs the HTTP server until it fails or the context is cancelled, then
@@ -137,11 +179,15 @@ func parseLevel(value string) slog.Level {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "debug":
 		return slog.LevelDebug
+	case "info", "":
+		return slog.LevelInfo
 	case "warning", "warn":
 		return slog.LevelWarn
 	case "error", "critical":
 		return slog.LevelError
 	default:
+		// Falling back silently would hide a typo in a deployment manifest.
+		fmt.Fprintf(os.Stderr, "llm-proxy: unknown log level %q, using info\n", value)
 		return slog.LevelInfo
 	}
 }

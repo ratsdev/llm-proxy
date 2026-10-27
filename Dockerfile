@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux \
     go build \
         -trimpath \
-        -ldflags="-s -w -X github.com/ratsdev/llm-proxy.Version=${VERSION}" \
+        -ldflags="-s -w -X github.com/ratsdev/llm-proxy/internal/version.Value=${VERSION}" \
         -o /out/llm-proxy ./cmd/llm-proxy
 
 # ---- runtime stage ---------------------------------------------------------
@@ -33,9 +33,17 @@ FROM alpine:3
 # /etc/ssl/certs/ca-certificates.crt, so no apk fetch is needed for TLS.
 COPY --from=build /out/llm-proxy /usr/local/bin/llm-proxy
 
-# Configuration is mounted at runtime, never baked into the image. The process
-# runs as root so it can read a config mounted at mode 0600 and owned by root.
-RUN mkdir -p /etc/llm-proxy
+# The process holds provider credentials and gateway API keys, so it runs as an
+# unprivileged user. /data is owned by that user before the volume is declared,
+# which keeps a named volume writable without a chown on the host.
+RUN addgroup -S -g 10001 llmproxy \
+ && adduser -S -u 10001 -G llmproxy -H -s /sbin/nologin llmproxy \
+ && mkdir -p /data \
+ && chown llmproxy:llmproxy /data
+
+VOLUME ["/data"]
+
+USER 10001:10001
 
 EXPOSE 4000
 
@@ -44,4 +52,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -q -O /dev/null http://127.0.0.1:4000/api/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/llm-proxy"]
-CMD ["--config", "/etc/llm-proxy/config.yaml"]
+CMD ["--db", "/data/llm-proxy.db"]

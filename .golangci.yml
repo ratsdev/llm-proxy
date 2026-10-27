@@ -1,0 +1,92 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - revive
+    - staticcheck
+    - bodyclose
+    - gocyclo
+    - gosec
+    - ineffassign
+    - misspell
+    - unconvert
+  settings:
+    revive:
+      rules:
+        - name: exported
+        - name: indent-error-flow
+        - name: error-strings
+        - name: receiver-naming
+        - name: context-as-argument
+    gocyclo:
+      min-complexity: 20
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+    rules:
+      # Test helpers return responses that the caller closes through t.Cleanup,
+      # which bodyclose cannot follow; the same helpers intentionally ignore
+      # teardown errors.
+      - path: .*_test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - gosec
+          - gocyclo
+      # Wire-format mappers and stream state machines are flat switches over
+      # protocol fields; splitting them would spread one wire contract across
+      # several functions without making it easier to review.
+      - path: internal/convert/protocols/.*\.go
+        linters:
+          - gocyclo
+      # These files only re-export types documented in their defining package.
+      - path: (internal/(gateway/core_alias|router/aliases|ui/alias)\.go)
+        linters:
+          - revive
+      # Forwarding the upstream body and calling the configured upstream are the
+      # gateway's purpose; gosec's taint analysis sees them as XSS/SSRF sinks.
+      - path: internal/gateway/relay\.go
+        linters:
+          - gosec
+        text: G705
+      - path: internal/router/router_retry\.go
+        linters:
+          - gosec
+        text: G704
+      # Routing jitter and round-robin shuffling are not security decisions, so
+      # math/rand is acceptable there only. Everywhere else G404 still fires.
+      - path: internal/router/.*\.go
+        linters:
+          - gosec
+        text: G404
+      # Provider and account records exist to carry secrets; they are never
+      # logged and are returned only to an authenticated console session.
+      - path: internal/core/.*\.go
+        linters:
+          - gosec
+        text: G117
+      # The database path comes from the operator's --db flag.
+      - path: internal/core/store\.go
+        linters:
+          - gosec
+        text: G304
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$

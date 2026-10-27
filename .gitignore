@@ -5,15 +5,21 @@
 *.prof
 coverage.out
 
-# Local configuration with secrets
-config.yaml
-config.local.yaml
+# SQLite configuration database and its WAL sidecars
+*.db
+*.db-wal
+*.db-shm
+/data/
+
+# Local environment overrides
 .env
 .env.*
 !.env.example
 
 # IDE / OS
 .trae/
+.trae-html-share-packages/
+.screenshots/
 .idea/
 .vscode/
 .DS_Store

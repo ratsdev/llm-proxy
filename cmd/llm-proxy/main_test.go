@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -16,21 +15,22 @@ func TestRunVersionExitsZero(t *testing.T) {
 	}
 }
 
-func TestRunRequiresConfig(t *testing.T) {
-	if code := run(nil); code != 2 {
+// -h/--help is a successful invocation: scripts and CI read a non-zero status
+// as a failure.
+func TestRunHelpExitsZero(t *testing.T) {
+	if code := run([]string{"--help"}); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+}
+
+func TestRunRejectsInvalidPort(t *testing.T) {
+	if code := run([]string{"--port", "70000"}); code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
 }
 
 func TestRunRejectsUnknownFlag(t *testing.T) {
 	if code := run([]string{"--does-not-exist"}); code != 2 {
-		t.Fatalf("exit code = %d, want 2", code)
-	}
-}
-
-func TestRunMissingConfigFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "missing.yaml")
-	if code := run([]string{"-c", path}); code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
 }

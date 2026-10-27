@@ -5,9 +5,11 @@
 *.prof
 coverage.out
 
-# Local configuration and secrets are mounted at runtime instead
-config.yaml
-config.local.yaml
+# Local databases and secrets are mounted at runtime instead
+*.db
+*.db-wal
+*.db-shm
+/data/
 .env
 .env.*
 
@@ -17,6 +19,8 @@ config.local.yaml
 .dockerignore
 Dockerfile
 .trae/
+.trae-html-share-packages/
+.screenshots/
 .idea/
 .vscode/
 .DS_Store
