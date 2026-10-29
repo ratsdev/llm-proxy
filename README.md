@@ -25,7 +25,7 @@ A self-hosted, multi-endpoint LLM gateway written in Go. Give every client one b
 - **Three independent endpoints:** OpenAI Chat, OpenAI Responses, and Claude Messages. A provider has one shared base URL; each endpoint adds its own upstream path and converter.
 - **Explicit endpoint converters.** An endpoint sets `converter` to `none` or to a directional converter ID such as `openai_chat_to_claude_messages`. `none` forwards the inbound wire format unchanged.
 - **Three-protocol conversion.** All six directions among `chat_completions`, `responses`, and `messages` are supported for requests, non-streaming responses, and streaming responses. The converters share the protocol-neutral IR in `internal/convert/ir/`; Gemini is intentionally out of scope.
-- **Lossless passthrough for same-protocol traffic.** JSON and SSE bodies are forwarded as-is in both streaming and non-streaming modes, with only the public model name rewritten, so `logprobs`, `system_fingerprint`, `service_tier`, extra choices, and vendor extensions survive. Cross-protocol traffic goes through the IR. Token usage is still extracted from both JSON replies and SSE events for the dashboard.
+- **Lossless passthrough for same-protocol traffic.** JSON and SSE bodies are forwarded as-is in both streaming and non-streaming modes, with only the public model name rewritten, so `logprobs`, `system_fingerprint`, `service_tier`, extra choices, and vendor extensions survive. Cross-protocol traffic goes through the IR. Token usage is still extracted from both JSON replies and SSE events for the dashboard; a streamed Chat Completions request also gains `stream_options.include_usage` upstream, and the resulting usage-only chunk is hidden again from callers that never asked for it.
 - **Routing strategies, retries, and failover.** Priority, round-robin, or random selection of the first provider; per-provider retry budgets, exponential backoff, `Retry-After` support, and automatic failover to the next candidate.
 - **Conversation affinity.** A session stays on the upstream that served it. Send `x-session-id` (or `x-conversation-id`) for a hard guarantee; otherwise the gateway fingerprints the first user message or uses `prompt_cache_key`.
 - **Streaming.** SSE bytes are relayed incrementally. An interrupted stream ends with the endpoint's terminal error event instead of a silent truncation.
@@ -243,7 +243,7 @@ Open `http://127.0.0.1:4000/`.
 
 | Page | Shows |
 | --- | --- |
-| Overview | Gateway version, uptime, success rate, token totals, 24-hour activity, model traffic and recent requests; administrators also see provider traffic. Members see only their own requests |
+| Overview | Gateway version, uptime, success rate, token totals, average TTFT (time-to-first-token) and output tokens per second for streaming replies, 24-hour activity, model traffic and recent requests; administrators also see provider traffic. Members see only their own requests |
 | Models | Card grid of every model the signed-in account may call, filtered by its `allowed_models` list |
 | Models (administration) | Public aliases, upstream bindings, input/output modalities, context/output limits, reasoning and tool support; create, edit, and delete |
 | Providers | NewAPI-style endpoint rows with type, converter, and path, upstream model catalog, retry/timeout settings, and proxy scheme; create, edit, and delete |
@@ -251,7 +251,7 @@ Open `http://127.0.0.1:4000/`.
 | Settings (administration) | Self-registration switch and the default model allow-list assigned to self-registered accounts |
 | API keys | Full gateway endpoint URLs plus every account's own credentials: create, copy, and delete |
 | Account | Identity, role, session expiry, and password change |
-| Requests | Recent model traffic: request ID, model, endpoint type, stream flag, status, latency, and tokens; provider details are administrator-only, and members see only their own requests |
+| Requests | Recent model traffic: request ID, model, endpoint type, stream flag, status, duration, TTFT, output tokens per second, and tokens; provider details are administrator-only, and members see only their own requests |
 
 The console's API lives under `/api/ui`: `POST /api/ui/register` (first administrator or self-registration), the public `GET /api/ui/registration` status, `POST /api/ui/login`, `POST /api/ui/logout`, `POST /api/ui/password`, `GET`/`PUT /api/ui/settings` for administrators, the member-facing `GET /api/ui/catalog`, authenticated reads, CRUD under `/api/ui/providers`, `/api/ui/models`, and `/api/ui/users`, and self-service key management under `/api/ui/keys`.
 
@@ -412,7 +412,7 @@ Every wire format parses into the protocol-neutral IR in `internal/convert/ir/`,
 - **Non-streaming response:** the upstream JSON is relayed as JSON regardless of whether the client asked for a stream. Same-protocol bytes are forwarded as-is apart from the public model name, so field order and unknown fields are preserved. Cross-protocol replies are rendered in the client's protocol, and usage is parsed in both modes for the dashboard.
 - **Streaming response:** SSE is relayed incrementally whenever the upstream returns SSE, even to a caller that did not set `stream`. Same-protocol frames have their `model` fields rewritten in place; cross-protocol frames are decoded from the upstream dialect and re-encoded in the client's dialect.
 - **Modes pass through:** the client's `stream` flag is forwarded upstream and never used to rewrite the reply shape. A JSON reply stays JSON and an SSE reply stays SSE.
-- **Usage:** token counts are extracted from non-streaming JSON and streaming SSE replies in both modes. TTFT/ITL are not computed for non-streaming replies; only input, output, and total token counts are recorded.
+- **Usage and timing:** token counts are extracted from non-streaming JSON and streaming SSE replies in both modes. Streaming replies also record time-to-first-token, measured from request start to the first response byte, and derive output tokens per second from the remaining stream duration. Buffered JSON replies arrive as a single write, so the dashboard leaves them out of both averages instead of treating the whole round trip as a first-token wait. To keep token counts available, a streamed Chat Completions request is sent upstream with `stream_options.include_usage`; the trailing usage-only chunk is relayed only to callers that requested it themselves.
 - **Interrupted stream:** the client receives the endpoint's terminal error event (`[DONE]` for OpenAI Chat, `event: error` for Claude Messages, `event: response.failed` for OpenAI Responses).
 - **Upstream ignored `stream`:** a complete JSON reply is relayed as JSON rather than synthesised into a stream.
 
@@ -425,7 +425,7 @@ Every wire format parses into the protocol-neutral IR in `internal/convert/ir/`,
 - **Errors:** endpoint-native JSON envelopes. Request failures include a stable `code` such as `model_not_found`, `model_not_allowed`, `invalid_json`, `unsupported_conversion`, or `upstream_error`.
 - **Request size:** request bodies are limited to 64 MiB.
 - **Response size:** buffered upstream replies are limited to 64 MiB; a single SSE line is limited to 8 MiB.
-- **Logging:** one structured access-log line per API operation, including request ID, user, model, provider, stream flag, status, duration, and token usage when known. Health and index probes are not logged.
+- **Logging:** one structured access-log line per API operation, including request ID, user, model, provider, stream flag, status, duration, `ttft_ms` for streamed replies, and token usage when known. Health and index probes are not logged.
 - **Timeouts:** model timeout overrides provider timeout, which defaults to 600 seconds. The timeout applies to the request and to stream inactivity. A single upstream stream is additionally capped at one hour, so a provider that keeps trickling bytes cannot hold a request open forever.
 - **Shutdown:** `SIGINT`/`SIGTERM` triggers a graceful shutdown with a 30-second deadline.
 - **Reloading:** configuration changes from the Web UI are applied immediately. The conversation pins, 429 cooldowns and round-robin cursors survive a reload, and upstream connections are reused; restarting the gateway clears them along with Web UI sessions and request history.
@@ -514,7 +514,7 @@ go build -trimpath \
 ## Limitations
 
 - Conversion covers `chat_completions`, `responses`, and `messages`; Gemini and other protocols are not supported.
-- No TTFT/ITL metrics; non-streaming requests record token usage only.
+- No per-token inter-token latency (ITL) series; the console reports time-to-first-token and an average output tokens per second per streaming request.
 - No per-user rate limiting, quotas, or cost accounting.
 - The gateway assumes a single instance: routing state, console sessions, request history and 429 cooldowns live in one process, and SQLite allows one writer. Run one replica per database; scale by giving different clients different instances, not by sharing one.
 - Console sign-in is throttled per account and per source address: five rejected attempts in five minutes delay that account for the rest of the window. The account-wide bucket resists distributed guessing but also lets anyone delay a known account for a few minutes; there is no captcha and no multi-factor login.

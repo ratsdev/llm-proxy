@@ -41,6 +41,10 @@ type requestLog struct {
 	inbound       WireFormat
 	upstream      WireFormat
 	stream        bool
+	// streamed reports that the relay actually wrote an SSE body. An upstream
+	// JSON reply to a streaming request is buffered, so it has no first-token
+	// timing even though the client asked for a stream.
+	streamed bool
 }
 
 type requestLogKey struct{}
@@ -135,6 +139,9 @@ func (s *Server) observe(next http.Handler) http.Handler {
 		r = r.WithContext(context.WithValue(r.Context(), requestLogKey{}, requestLog))
 
 		defer func() {
+			// Snapshot the first-byte time before the recovery path can write a
+			// synthetic error frame: that frame must not become the TTFT sample.
+			ttftMS := recorder.timeToFirstByte(started)
 			if value := recover(); value != nil {
 				s.logger.Error("panic recovered",
 					"panic", value,
@@ -159,7 +166,11 @@ func (s *Server) observe(next http.Handler) http.Handler {
 			}
 			attrs := requestLog.fields()
 			status := responseStatus(recorder, r)
-			attrs = append(attrs, "status", status, "duration_ms", time.Since(started).Milliseconds())
+			timing := requestTiming{elapsed: time.Since(started), ttftMS: ttftMS}
+			attrs = append(attrs, "status", status, "duration_ms", timing.elapsed.Milliseconds())
+			if requestLog.streamed && timing.ttftMS > 0 {
+				attrs = append(attrs, "ttft_ms", timing.ttftMS)
+			}
 			if requestLog.usage != nil {
 				// Structured attributes instead of a formatted string: log pipelines
 				// can sum and alert on these without parsing prose.
@@ -169,7 +180,7 @@ func (s *Server) observe(next http.Handler) http.Handler {
 					"total_tokens", requestLog.usage.TotalTokens())
 			}
 			if requestLog.model != "" {
-				s.recordUIRequest(requestLog, started, status)
+				s.recordUIRequest(requestLog, started, timing, status)
 			}
 			level := slog.LevelInfo
 			if status >= http.StatusInternalServerError {
@@ -186,6 +197,10 @@ type responseRecorder struct {
 	http.ResponseWriter
 	wroteHeader bool
 	status      int
+	// firstWrite is when the handler produced its first response byte. It is
+	// the closest observable proxy for time-to-first-token, because relay
+	// writes each SSE frame as soon as the upstream emits it.
+	firstWrite time.Time
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
@@ -201,7 +216,20 @@ func (r *responseRecorder) Write(data []byte) (int, error) {
 	if !r.wroteHeader {
 		r.WriteHeader(http.StatusOK)
 	}
+	if r.firstWrite.IsZero() && len(data) > 0 {
+		r.firstWrite = time.Now()
+	}
 	return r.ResponseWriter.Write(data)
+}
+
+// timeToFirstByte reports how long the handler took to produce its first
+// response byte. Zero means nothing was written, so no latency is known and
+// the sample must be skipped when aggregating.
+func (r *responseRecorder) timeToFirstByte(started time.Time) int64 {
+	if r.firstWrite.IsZero() {
+		return 0
+	}
+	return r.firstWrite.Sub(started).Milliseconds()
 }
 
 // statusCode reports the status actually sent to the client.
@@ -227,10 +255,17 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
+// requestTiming is the latency sample of one completed request. It is passed as
+// a unit so the elapsed time and the first-byte time cannot be swapped.
+type requestTiming struct {
+	elapsed time.Duration
+	ttftMS  int64
+}
+
 // recordUIRequest feeds the in-memory dashboard window. Only model requests
 // reach this path, so health probes and the Web UI itself stay out of the
 // traffic statistics.
-func (s *Server) recordUIRequest(log *requestLog, started time.Time, status int) {
+func (s *Server) recordUIRequest(log *requestLog, started time.Time, timing requestTiming, status int) {
 	record := ui.RequestRecord{
 		Time:          started.UTC(),
 		RequestID:     log.requestID,
@@ -244,12 +279,15 @@ func (s *Server) recordUIRequest(log *requestLog, started time.Time, status int)
 		Upstream:      string(log.upstream),
 		Stream:        log.stream,
 		Status:        status,
-		DurationMS:    time.Since(started).Milliseconds(),
+		DurationMS:    timing.elapsed.Milliseconds(),
 	}
 	if log.usage != nil {
 		record.InputTokens = log.usage.PromptTokens()
 		record.OutputTokens = log.usage.OutputTokens
 		record.TotalTokens = log.usage.TotalTokens()
+	}
+	if log.streamed {
+		record.TTFTMS = timing.ttftMS
 	}
 	s.ui.RecordRequest(record)
 }

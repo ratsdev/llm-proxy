@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	routing "github.com/ratsdev/llm-proxy/internal/router"
+	"github.com/ratsdev/llm-proxy/internal/util"
 )
 
 func TestServerChatRewritesModelAndSetsHeaders(t *testing.T) {
@@ -145,5 +146,78 @@ func TestServerEmbeddedJSONErrorObject(t *testing.T) {
 	data, _ := io.ReadAll(response.Body)
 	if !strings.Contains(string(data), "boom") {
 		t.Fatalf("error body = %s", data)
+	}
+}
+
+// usageStream returns a Chat Completions SSE reply shaped like the one an
+// upstream sends when stream_options.include_usage is set.
+func usageStream() *RouteResult {
+	return &RouteResult{
+		ProviderID:    "provider",
+		UpstreamModel: "model-a",
+		WireFormat:    wireChatCompletions,
+		Status:        http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"id\":\"c\",\"model\":\"model-a\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+				"data: {\"id\":\"c\",\"model\":\"model-a\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":5}}\n\n" +
+				"data: [DONE]\n\n")),
+	}
+}
+
+// The gateway asks a Chat Completions upstream for the trailing usage chunk so
+// the console can report throughput, then hides it from a caller that never
+// requested usage.
+func TestServerRequestsStreamUsageAndHidesTheChunk(t *testing.T) {
+	t.Parallel()
+
+	router := &fakeRouter{
+		send: func(model *Model, payload map[string]any, stickyID, inboundProtocol string) (*RouteResult, error) {
+			return usageStream(), nil
+		},
+	}
+	server := newTestServer(t, router, nil)
+
+	response := doJSON(t, http.MethodPost, server.URL+"/api/v1/chat/completions", "key-a",
+		`{"model":"model/a","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	body := readBody(t, response)
+
+	router.mu.Lock()
+	sent := router.lastPayload
+	router.mu.Unlock()
+	options, _ := util.AsMap(sent["stream_options"])
+	if !util.Truthy(options["include_usage"]) {
+		t.Fatalf("upstream payload = %v", sent)
+	}
+	if strings.Contains(body, "usage") {
+		t.Fatalf("usage chunk leaked to the caller: %s", body)
+	}
+	if strings.Count(body, "data:") != 2 {
+		t.Fatalf("stream was not filtered: %s", body)
+	}
+}
+
+// A caller that asked for usage still receives the chunk the gateway requested.
+func TestServerKeepsRequestedStreamUsage(t *testing.T) {
+	t.Parallel()
+
+	router := &fakeRouter{
+		send: func(model *Model, payload map[string]any, stickyID, inboundProtocol string) (*RouteResult, error) {
+			return usageStream(), nil
+		},
+	}
+	server := newTestServer(t, router, nil)
+
+	response := doJSON(t, http.MethodPost, server.URL+"/api/v1/chat/completions", "key-a",
+		`{"model":"model/a","stream":true,"stream_options":{"include_usage":true},`+
+			`"messages":[{"role":"user","content":"hi"}]}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	if body := readBody(t, response); !strings.Contains(body, `"usage"`) {
+		t.Fatalf("requested usage chunk was dropped: %s", body)
 	}
 }

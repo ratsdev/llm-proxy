@@ -89,6 +89,40 @@
     return (value / 60000).toFixed(1) + " min";
   }
 
+  // formatRate renders a decode throughput in output tokens per second.
+  function formatRate(value) {
+    const number = Number(value || 0);
+    if (!Number.isFinite(number) || number <= 0) return "—";
+    return (number >= 100 ? Math.round(number) : number.toFixed(1)) + " tok/s";
+  }
+
+  // formatLatency renders a duration that may be absent. A missing sample shows
+  // as an em dash instead of a misleading 0 ms.
+  function formatLatency(ms) {
+    const value = Number(ms || 0);
+    if (value <= 0) return "—";
+    return formatDuration(value);
+  }
+
+  // formatTTFT renders time-to-first-token. The server only records it for
+  // replies it actually streamed and never samples a failed request.
+  function formatTTFT(record) {
+    if (Number(record.status || 0) >= 400) return "—";
+    return formatLatency(record.ttft_ms);
+  }
+
+  // outputRate derives one request's decode throughput from its total duration,
+  // its time-to-first-token and its output tokens. It mirrors the server-side
+  // aggregation, which also skips failed requests.
+  function outputRate(record) {
+    if (Number(record.status || 0) >= 400) return 0;
+    const duration = Number(record.duration_ms || 0);
+    const ttft = Number(record.ttft_ms || 0);
+    const output = Number(record.output_tokens || 0);
+    if (output <= 0 || ttft <= 0 || duration <= ttft) return 0;
+    return output / ((duration - ttft) / 1000);
+  }
+
   function formatDate(iso) {
     if (!iso) return "—";
     const date = new Date(iso);
@@ -136,6 +170,10 @@
     formatSize,
     compact,
     formatDuration,
+    formatLatency,
+    formatRate,
+    formatTTFT,
+    outputRate,
     formatDate,
     formatClock,
     timeAgo,

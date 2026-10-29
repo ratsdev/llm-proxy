@@ -58,3 +58,33 @@ func usageFromStreamLine(line []byte) (Usage, bool) {
 	}
 	return usageFromObject(object)
 }
+
+// isUsageOnlyChunk reports whether an SSE data line carries nothing but token
+// usage. Chat Completions upstreams append such a chunk after the last content
+// delta when stream_options.include_usage is set, and the gateway asks for that
+// chunk itself when the console needs throughput numbers.
+func isUsageOnlyChunk(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	const prefix = "data:"
+	if !bytes.HasPrefix(trimmed, []byte(prefix)) {
+		return false
+	}
+	payload := bytes.TrimSpace(trimmed[len(prefix):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) ||
+		!bytes.Contains(payload, []byte(`"usage"`)) {
+		return false
+	}
+	value, err := util.Decode(payload)
+	if err != nil {
+		return false
+	}
+	object, ok := util.AsMap(value)
+	if !ok {
+		return false
+	}
+	if _, ok := usageFromObject(object); !ok {
+		return false
+	}
+	choices, ok := object["choices"].([]any)
+	return !ok || len(choices) == 0
+}

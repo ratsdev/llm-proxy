@@ -24,9 +24,13 @@ type RequestRecord struct {
 	Stream        bool      `json:"stream"`
 	Status        int       `json:"status"`
 	DurationMS    int64     `json:"duration_ms"`
-	InputTokens   int       `json:"input_tokens"`
-	OutputTokens  int       `json:"output_tokens"`
-	TotalTokens   int       `json:"total_tokens"`
+	// TTFTMS is the time from request start to the first response byte, which
+	// for a stream is effectively time-to-first-token. Zero means nothing was
+	// written, so no latency sample exists for this record.
+	TTFTMS       int64 `json:"ttft_ms"`
+	InputTokens  int   `json:"input_tokens"`
+	OutputTokens int   `json:"output_tokens"`
+	TotalTokens  int   `json:"total_tokens"`
 }
 
 type uiBreakdown struct {
@@ -35,6 +39,10 @@ type uiBreakdown struct {
 	Errors        int     `json:"errors"`
 	TotalTokens   int     `json:"total_tokens"`
 	AvgDurationMS float64 `json:"avg_duration_ms"`
+	AvgTTFTMS     float64 `json:"avg_ttft_ms"`
+	AvgOutputTPS  float64 `json:"avg_output_tps"`
+
+	timing uiTiming
 }
 
 type uiSummary struct {
@@ -46,6 +54,55 @@ type uiSummary struct {
 	OutputTokens  int     `json:"output_tokens"`
 	TotalTokens   int     `json:"total_tokens"`
 	AvgDurationMS float64 `json:"avg_duration_ms"`
+	AvgTTFTMS     float64 `json:"avg_ttft_ms"`
+	AvgOutputTPS  float64 `json:"avg_output_tps"`
+
+	timing uiTiming
+}
+
+// uiTiming accumulates streaming latency samples. Time-to-first-token and the
+// decode rate only make sense while a reply is generated incrementally: a
+// buffered JSON reply arrives as one write, so the gateway records no TTFT for
+// it and these accumulators skip records without one.
+type uiTiming struct {
+	ttftMS    int64
+	ttftCount int
+	genTokens int
+	genTimeMS int64
+}
+
+func (t *uiTiming) add(record RequestRecord) {
+	if record.Status >= http.StatusBadRequest {
+		return
+	}
+	if record.TTFTMS <= 0 || record.DurationMS <= record.TTFTMS {
+		return
+	}
+	t.ttftMS += record.TTFTMS
+	t.ttftCount++
+	if record.OutputTokens > 0 {
+		t.genTokens += record.OutputTokens
+		t.genTimeMS += record.DurationMS - record.TTFTMS
+	}
+}
+
+// avgTTFT returns the mean time-to-first-token in milliseconds, or zero when
+// the window holds no streaming sample.
+func (t uiTiming) avgTTFT() float64 {
+	if t.ttftCount == 0 {
+		return 0
+	}
+	return float64(t.ttftMS) / float64(t.ttftCount)
+}
+
+// outputTPS returns the window's weighted decode throughput: total output
+// tokens divided by the time spent streaming them, excluding the wait for the
+// first token. Zero means no usable sample.
+func (t uiTiming) outputTPS() float64 {
+	if t.genTimeMS <= 0 || t.genTokens == 0 {
+		return 0
+	}
+	return float64(t.genTokens) / (float64(t.genTimeMS) / 1000)
 }
 
 type uiBucket struct {
@@ -175,6 +232,7 @@ func uiRequestPayload(record RequestRecord, includeProvider bool) map[string]any
 		"stream":        record.Stream,
 		"status":        record.Status,
 		"duration_ms":   record.DurationMS,
+		"ttft_ms":       record.TTFTMS,
 		"input_tokens":  record.InputTokens,
 		"output_tokens": record.OutputTokens,
 		"total_tokens":  record.TotalTokens,
@@ -234,6 +292,7 @@ func summarizeUI(records []RequestRecord, now time.Time) (uiSummary, []uiBucket,
 		summary.OutputTokens += record.OutputTokens
 		summary.TotalTokens += record.TotalTokens
 		totalDuration += record.DurationMS
+		summary.timing.add(record)
 
 		if !record.Time.Before(start) {
 			index := int(record.Time.Sub(start) / time.Hour)
@@ -255,6 +314,8 @@ func summarizeUI(records []RequestRecord, now time.Time) (uiSummary, []uiBucket,
 		summary.SuccessRate = float64(summary.Success) / float64(summary.Requests) * 100
 		summary.AvgDurationMS = float64(totalDuration) / float64(summary.Requests)
 	}
+	summary.AvgTTFTMS = summary.timing.avgTTFT()
+	summary.AvgOutputTPS = summary.timing.outputTPS()
 	return summary, buckets, sortedBreakdowns(modelStats), sortedBreakdowns(providerStats)
 }
 
@@ -276,6 +337,7 @@ func addBreakdown(stats map[string]*uiBreakdown, id, name, emptyLabel string, re
 	entry.Requests++
 	entry.TotalTokens += record.TotalTokens
 	entry.AvgDurationMS += float64(record.DurationMS)
+	entry.timing.add(record)
 	if record.Status >= http.StatusBadRequest {
 		entry.Errors++
 	}
@@ -287,6 +349,8 @@ func sortedBreakdowns(stats map[string]*uiBreakdown) []uiBreakdown {
 		if entry.Requests > 0 {
 			entry.AvgDurationMS /= float64(entry.Requests)
 		}
+		entry.AvgTTFTMS = entry.timing.avgTTFT()
+		entry.AvgOutputTPS = entry.timing.outputTPS()
 		out = append(out, *entry)
 	}
 	sort.Slice(out, func(i, j int) bool {

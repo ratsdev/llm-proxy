@@ -13,6 +13,10 @@
     formatSize,
     compact,
     formatDuration,
+    formatLatency,
+    formatRate,
+    formatTTFT,
+    outputRate,
     formatDate,
     formatClock,
     timeAgo,
@@ -1571,7 +1575,12 @@
         compact(summary.total_tokens),
         compact(summary.input_tokens) + " input · " + compact(summary.output_tokens) + " output"
       ),
-      metricCard("Avg Latency", requests ? formatDuration(summary.avg_duration_ms) : "—", "Per request"),
+      metricCard(
+        "Avg TTFT",
+        formatLatency(summary.avg_ttft_ms),
+        "Time to first token"
+      ),
+      metricCard("Output Speed", formatRate(summary.avg_output_tps), "Tokens per second"),
     ]);
 
     const activity = el("section", { class: "card" }, [
@@ -1669,7 +1678,8 @@
                 el("th", { text: nameColumn || "Name" }),
                 el("th", { text: "Requests" }),
                 el("th", { text: "Tokens" }),
-                el("th", { text: "Avg Latency" }),
+                el("th", { text: "TTFT" }),
+                el("th", { text: "Tok/s" }),
               ])
             ),
             el(
@@ -1680,7 +1690,8 @@
                   el("td", {}, el("span", { class: "mono ellipsis", title: row.name, text: row.name })),
                   el("td", { text: formatNumber(row.requests) }),
                   el("td", { text: compact(row.total_tokens) }),
-                  el("td", { text: formatDuration(row.avg_duration_ms) }),
+                  el("td", { text: formatLatency(row.avg_ttft_ms) }),
+                  el("td", { text: formatRate(row.avg_output_tps) }),
                 ])
               )
             ),
@@ -1704,7 +1715,7 @@
       );
     }
     const columns = compactMode
-      ? ["Time", "Model", ...(showProvider ? ["Provider"] : []), "Status", "Duration", "Tokens"]
+      ? ["Time", "Model", ...(showProvider ? ["Provider"] : []), "Status", "Duration", "TTFT", "Tok/s", "Tokens"]
       : [
           "Time",
           "Request ID",
@@ -1713,6 +1724,8 @@
           "Endpoint",
           "Status",
           "Duration",
+          "TTFT",
+          "Tok/s",
           "Tokens",
         ];
 
@@ -1765,6 +1778,8 @@
       }
       cells.push(el("td", {}, statusBadge(record.status)));
       cells.push(el("td", { class: "nowrap", text: formatDuration(record.duration_ms) }));
+      cells.push(el("td", { class: "nowrap", text: formatTTFT(record) }));
+      cells.push(el("td", { class: "nowrap", text: formatRate(outputRate(record)) }));
       cells.push(
         el("td", {
           class: "nowrap",

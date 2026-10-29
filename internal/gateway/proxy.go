@@ -42,6 +42,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, spec routeS
 	log.inbound = spec.Wire
 
 	stream, _ := util.AsBool(payload["stream"])
+	// Ask a Chat Completions upstream for its trailing usage chunk even when the
+	// caller did not: the console needs output tokens to report throughput. The
+	// relay drops that extra chunk again for callers that never asked for it.
+	clientUsage := inboundStreamIncludeUsage(spec.Wire, payload)
+	injectedUsage := requestStreamUsage(payload, spec.Wire, stream)
 	stickyID := router.SessionKey(r.Header, payload, userID(user), model.ID)
 	routeRequest := RouteRequest{
 		Model:           model,
@@ -81,12 +86,33 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, spec routeS
 	w.Header().Set("x-upstream-model", result.UpstreamModel)
 
 	relay := &relaySpec{
-		mode:         planMode(result.WireFormat == spec.Wire, isJSONResponse(result)),
-		modelID:      modelID,
-		inbound:      spec.Wire,
-		upstream:     result.WireFormat,
-		includeUsage: inboundStreamIncludeUsage(spec.Wire, payload),
-		log:          log,
+		mode:           planMode(result.WireFormat == spec.Wire, isJSONResponse(result)),
+		modelID:        modelID,
+		inbound:        spec.Wire,
+		upstream:       result.WireFormat,
+		includeUsage:   clientUsage,
+		dropUsageChunk: injectedUsage && !clientUsage,
+		log:            log,
 	}
 	s.relay(w, r, result, relay)
+}
+
+// requestStreamUsage sets stream_options.include_usage on a streamed Chat
+// Completions request. Most providers only append their token usage when the
+// flag is set, and the console derives output throughput from it. It reports
+// whether the flag was added.
+func requestStreamUsage(payload map[string]any, wire WireFormat, stream bool) bool {
+	if !stream || wire != wireChatCompletions {
+		return false
+	}
+	options, _ := util.AsMap(payload["stream_options"])
+	if util.Truthy(options["include_usage"]) {
+		return false
+	}
+	if options == nil {
+		options = make(map[string]any, 1)
+		payload["stream_options"] = options
+	}
+	options["include_usage"] = true
+	return true
 }

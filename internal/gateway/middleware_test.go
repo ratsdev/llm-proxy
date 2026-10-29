@@ -229,6 +229,108 @@ func TestServerLogsRejectedPaths(t *testing.T) {
 	}
 }
 
+// A streamed reply must reach the console with a TTFT measured at the first
+// frame and a throughput derived from the time spent after that frame, not
+// from the whole round trip.
+func TestObserveRecordsStreamTiming(t *testing.T) {
+	t.Parallel()
+
+	const firstFrame = "data: {\"id\":\"chatcmpl-1\",\"model\":\"model-a\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	const lastFrames = "data: {\"id\":\"chatcmpl-1\",\"model\":\"model-a\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":20}}\n\n" +
+		"data: [DONE]\n\n"
+
+	consumer, producer := io.Pipe()
+	t.Cleanup(func() { _ = consumer.Close() })
+	// The upstream starts emitting only once the gateway reads the body, so the
+	// delays measure what the client waits for, not how long the test took to
+	// set up.
+	produce := func() {
+		defer producer.Close()
+		time.Sleep(80 * time.Millisecond)
+		_, _ = producer.Write([]byte(firstFrame))
+		time.Sleep(120 * time.Millisecond)
+		_, _ = producer.Write([]byte(lastFrames))
+	}
+
+	router := &fakeRouter{
+		send: func(model *Model, payload map[string]any, stickyID, inboundProtocol string) (*RouteResult, error) {
+			go produce()
+			return &RouteResult{
+				ProviderID:    "provider",
+				UpstreamModel: "model-a",
+				WireFormat:    wireChatCompletions,
+				Status:        http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:          consumer,
+			}, nil
+		},
+	}
+	server := newTestServer(t, router, nil)
+
+	response := doJSON(t, http.MethodPost, server.URL+"/api/v1/chat/completions", "key-a",
+		`{"model":"model/a","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	_ = readBody(t, response)
+
+	client := uiLogin(t, server)
+	record := firstConsoleRecord(t, client, server)
+
+	ttft, _ := record["ttft_ms"].(float64)
+	duration, _ := record["duration_ms"].(float64)
+	if ttft < 70 || ttft >= duration {
+		t.Fatalf("ttft = %v, duration = %v", ttft, duration)
+	}
+
+	overview := uiDecode(t, uiCall(t, client, http.MethodGet, server.URL+"/api/ui/overview", "", nil))
+	summary, _ := overview["summary"].(map[string]any)
+	avgTTFT, _ := summary["avg_ttft_ms"].(float64)
+	if avgTTFT != ttft {
+		t.Fatalf("summary avg ttft = %v, record ttft = %v", avgTTFT, ttft)
+	}
+	if tps, _ := summary["avg_output_tps"].(float64); tps <= 0 {
+		t.Fatalf("summary output throughput = %v", tps)
+	}
+}
+
+// An upstream that ignores stream and answers with a buffered JSON body has no
+// first-token timing, so the console must report it as unknown instead of
+// reusing the round-trip time.
+func TestObserveSkipsTTFTForBufferedReplies(t *testing.T) {
+	t.Parallel()
+
+	server := newTestServer(t, &fakeRouter{}, nil)
+	response := doJSON(t, http.MethodPost, server.URL+"/api/v1/chat/completions", "key-a",
+		`{"model":"model/a","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	_ = readBody(t, response)
+
+	record := firstConsoleRecord(t, uiLogin(t, server), server)
+	if ttft, _ := record["ttft_ms"].(float64); ttft != 0 {
+		t.Fatalf("buffered reply ttft = %v", ttft)
+	}
+}
+
+// firstConsoleRecord waits for the dashboard to report one completed request.
+func firstConsoleRecord(t *testing.T, client *http.Client, server *httptest.Server) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		payload := uiDecode(t, uiCall(t, client, http.MethodGet, server.URL+"/api/ui/requests", "", nil))
+		if list, _ := payload["records"].([]any); len(list) > 0 {
+			record, _ := list[0].(map[string]any)
+			return record
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("request was not recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestResponseStatusReportsAbandonedRequest(t *testing.T) {
 	t.Parallel()
 
@@ -244,5 +346,41 @@ func TestResponseStatusReportsAbandonedRequest(t *testing.T) {
 	recorder.WriteHeader(http.StatusCreated)
 	if status := responseStatus(recorder, request); status != http.StatusCreated {
 		t.Fatalf("committed response status = %d", status)
+	}
+}
+
+// timeToFirstByte must stay unset until the handler actually writes a body: a
+// stream that only commits headers has not produced its first token yet.
+func TestResponseRecorderTracksFirstByte(t *testing.T) {
+	t.Parallel()
+
+	started := time.Now().Add(-50 * time.Millisecond)
+	recorder := &responseRecorder{ResponseWriter: httptest.NewRecorder()}
+	if ttft := recorder.timeToFirstByte(started); ttft != 0 {
+		t.Fatalf("ttft before first write = %d", ttft)
+	}
+
+	recorder.WriteHeader(http.StatusOK)
+	if ttft := recorder.timeToFirstByte(started); ttft != 0 {
+		t.Fatalf("ttft after headers only = %d", ttft)
+	}
+
+	if _, err := recorder.Write([]byte("data: {}\n\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	first := recorder.firstWrite
+	if first.IsZero() {
+		t.Fatal("first write was not timestamped")
+	}
+	if ttft := recorder.timeToFirstByte(started); ttft < 45 {
+		t.Fatalf("ttft = %d, want at least 45ms", ttft)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if _, err := recorder.Write([]byte("more")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !recorder.firstWrite.Equal(first) {
+		t.Fatal("first write timestamp moved on a later write")
 	}
 }

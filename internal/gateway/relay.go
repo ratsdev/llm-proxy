@@ -53,7 +53,11 @@ type relaySpec struct {
 	inbound      convert.Format
 	upstream     convert.Format
 	includeUsage bool
-	log          *requestLog
+	// dropUsageChunk hides the trailing usage-only chunk that the gateway
+	// requested upstream on behalf of the console, so a caller that did not ask
+	// for usage still sees the stream it expects.
+	dropUsageChunk bool
+	log            *requestLog
 }
 
 // relay writes one upstream reply back to the client and owns the shared
@@ -69,9 +73,11 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, result *RouteResu
 	case relayPassthroughJSON, relayConvertJSON:
 		s.relayJSON(w, r, result, spec)
 	case relayPassthroughSSE:
+		spec.log.streamed = true
 		startStream(w, result.Status)
 		s.relaySSE(w, r, result, spec)
 	case relayConvertSSE:
+		spec.log.streamed = true
 		startStream(w, result.Status)
 		s.relayConvertSSE(w, r, result, spec)
 	}
@@ -171,7 +177,7 @@ func (s *Server) relaySSE(w http.ResponseWriter, r *http.Request, result *RouteR
 			merged := current.Merged(&usage)
 			spec.log.usage = &merged
 		}
-		if len(line) > 0 {
+		if len(line) > 0 && !(spec.dropUsageChunk && isUsageOnlyChunk(line)) {
 			if _, writeErr := writeToClient(w, line); writeErr != nil {
 				s.logger.Debug("client disconnected during stream", append(spec.log.fields(), "error", writeErr)...)
 				return
