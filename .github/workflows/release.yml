@@ -118,7 +118,7 @@ jobs:
             mkdir -p "$stage"
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build \
               -trimpath \
-              -ldflags="-s -w -X github.com/ratsdev/llm-proxy/internal/version.Value=${version}" \
+              -ldflags="-s -w -X github.com/ratsdev/llm-proxy/internal/core.Value=${version}" \
               -o "${stage}/${bin}" ./cmd/llm-proxy
             cp LICENSE "$stage/"
 

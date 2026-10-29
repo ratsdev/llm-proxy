@@ -10,19 +10,19 @@ import (
 )
 
 const (
-	// uiLoginMaxFailures is the number of rejected sign-ins one key may collect
+	// loginMaxFailures is the number of rejected sign-ins one key may collect
 	// inside one window before it is throttled.
-	uiLoginMaxFailures = 5
-	uiLoginWindow      = 5 * time.Minute
-	// uiRegisterMaxAttempts caps how many registrations one source address may
+	loginMaxFailures = 5
+	loginWindow      = 5 * time.Minute
+	// registerMaxAttempts caps how many registrations one source address may
 	// start inside one window. Each attempt derives a PBKDF2 verifier and, when
 	// accepted, writes an account, so this bounds both CPU work and account
 	// growth.
-	uiRegisterMaxAttempts = 20
-	uiRegisterWindow      = time.Hour
-	// uiLimiterMaxKeys bounds every limiter: a spray of usernames or source
+	registerMaxAttempts = 20
+	registerWindow      = time.Hour
+	// limiterMaxKeys bounds every limiter: a spray of usernames or source
 	// addresses must not grow one without limit.
-	uiLimiterMaxKeys = 4096
+	limiterMaxKeys = 4096
 )
 
 // attemptLimiter throttles repeated console attempts per key inside a window.
@@ -96,7 +96,7 @@ func (l *attemptLimiter) reset(keys []string) {
 // still full, entries are dropped until it is half empty, which costs at most one
 // extra attempt per dropped key.
 func (l *attemptLimiter) pruneLocked(now time.Time) {
-	if len(l.entries) < uiLimiterMaxKeys {
+	if len(l.entries) < limiterMaxKeys {
 		return
 	}
 	for key, entry := range l.entries {
@@ -105,7 +105,7 @@ func (l *attemptLimiter) pruneLocked(now time.Time) {
 		}
 	}
 	for key := range l.entries {
-		if len(l.entries) < uiLimiterMaxKeys/2 {
+		if len(l.entries) < limiterMaxKeys/2 {
 			return
 		}
 		delete(l.entries, key)

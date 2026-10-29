@@ -1,3 +1,7 @@
+// Store lifecycle: connection pragmas, the provider/model/user round trip the
+// gateway depends on, the rules LoadConfig enforces, and the registration
+// settings that live in the settings table.
+
 package core
 
 import (
@@ -167,5 +171,158 @@ func TestStoreProviderModelUserLifecycle(t *testing.T) {
 		t.Fatalf("reload after delete: %v", err)
 	} else if cfg.UsersByKey[key.Key] != nil {
 		t.Fatal("deleted user's API key survived")
+	}
+}
+
+// LoadConfig is the bridge between stored rows and the request path, so the
+// rules it enforces are covered here rather than through a full gateway test.
+
+func TestLoadConfigRejectsUnknownProviderReference(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t, filepath.Join(t.TempDir(), "proxy.db"))
+	// Bypass SaveModel's validation to simulate a database edited outside the
+	// gateway (or a partial restore). Referential integrity has to be switched
+	// off for the seed; the store uses a single connection, so the PRAGMA
+	// applies to the statements below.
+	if _, err := store.db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	t.Cleanup(func() { _, _ = store.db.Exec(`PRAGMA foreign_keys = ON`) })
+	if _, err := store.db.Exec(`INSERT INTO models (id, name) VALUES ('broken', 'Broken')`); err != nil {
+		t.Fatalf("seed model: %v", err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO model_providers (model_id, provider_id, upstream_model)
+		VALUES ('broken', 'ghost', 'up')`); err != nil {
+		t.Fatalf("seed binding: %v", err)
+	}
+
+	if _, err := store.LoadConfig(); err == nil {
+		t.Fatal("model bound to an unknown provider was loaded")
+	} else if !strings.Contains(err.Error(), "unknown provider") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadConfigSkipsEmptyAPIKey(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t, filepath.Join(t.TempDir(), "proxy.db"))
+	if _, err := store.SaveUser(UserInput{ID: "alice", Password: "alice-password"}); err != nil {
+		t.Fatalf("save user: %v", err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO api_keys (id, user_id, name, key, created_at)
+		VALUES ('key-empty', 'alice', 'Empty', '', '2024-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed empty key: %v", err)
+	}
+
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.UsersByKey) != 0 {
+		t.Fatalf("empty key authenticated: %+v", cfg.UsersByKey)
+	}
+	// An empty key table disables authentication entirely, which would be a
+	// serious regression if an empty row could produce it.
+	if cfg.AuthEnabled() {
+		t.Fatal("auth reported as enabled without a usable key")
+	}
+}
+
+func TestLoadConfigReadsDropParamsSetting(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t, filepath.Join(t.TempDir(), "proxy.db"))
+	if _, err := store.db.Exec(`INSERT INTO settings (key, value) VALUES ('drop_params', 'TRUE')`); err != nil {
+		t.Fatalf("seed setting: %v", err)
+	}
+
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.DropParams {
+		t.Fatal("drop_params setting was not applied")
+	}
+}
+
+func TestLoadConfigDefaultsWithoutSettings(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t, filepath.Join(t.TempDir(), "proxy.db"))
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.DropParams {
+		t.Fatal("drop_params defaulted to enabled")
+	}
+	if len(cfg.Providers) != 0 || len(cfg.Models) != 0 || len(cfg.UsersByKey) != 0 {
+		t.Fatalf("empty database produced a non-empty snapshot")
+	}
+}
+
+// Registration settings.
+
+func TestRegistrationSettingsDefaultsAndRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t, filepath.Join(t.TempDir(), "proxy.db"))
+	settings, err := store.RegistrationSettings()
+	if err != nil {
+		t.Fatalf("RegistrationSettings() error = %v", err)
+	}
+	if settings.SelfRegistration {
+		t.Fatal("self-registration defaulted to enabled")
+	}
+	if len(settings.DefaultAllowedModels) != 0 {
+		t.Fatalf("default allowed models = %v, want none", settings.DefaultAllowedModels)
+	}
+
+	saved, err := store.SaveRegistrationSettings(RegistrationSettings{
+		SelfRegistration:     true,
+		DefaultAllowedModels: []string{"m1", "m1", ""},
+	})
+	if err != nil {
+		t.Fatalf("SaveRegistrationSettings() error = %v", err)
+	}
+	if !saved.SelfRegistration {
+		t.Fatal("saved settings lost the switch")
+	}
+	if len(saved.DefaultAllowedModels) != 1 || saved.DefaultAllowedModels[0] != "m1" {
+		t.Fatalf("saved allowed models = %v", saved.DefaultAllowedModels)
+	}
+
+	reloaded, err := store.RegistrationSettings()
+	if err != nil {
+		t.Fatalf("RegistrationSettings() after save error = %v", err)
+	}
+	if !reloaded.SelfRegistration || len(reloaded.DefaultAllowedModels) != 1 || reloaded.DefaultAllowedModels[0] != "m1" {
+		t.Fatalf("reloaded settings = %+v", reloaded)
+	}
+
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if !cfg.SelfRegistration || len(cfg.DefaultAllowedModels) != 1 || cfg.DefaultAllowedModels[0] != "m1" {
+		t.Fatalf("config registration settings = %+v", cfg)
+	}
+}
+
+func TestRegistrationSettingsWildcardReplacesList(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t, filepath.Join(t.TempDir(), "proxy.db"))
+	saved, err := store.SaveRegistrationSettings(RegistrationSettings{
+		SelfRegistration:     true,
+		DefaultAllowedModels: []string{"m1", "*", "m2"},
+	})
+	if err != nil {
+		t.Fatalf("SaveRegistrationSettings() error = %v", err)
+	}
+	if len(saved.DefaultAllowedModels) != 1 || saved.DefaultAllowedModels[0] != "*" {
+		t.Fatalf("wildcard allow-list = %v, want the wildcard alone", saved.DefaultAllowedModels)
 	}
 }

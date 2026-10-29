@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/ratsdev/llm-proxy/internal/convert"
+	"github.com/ratsdev/llm-proxy/internal/core"
 	"github.com/ratsdev/llm-proxy/internal/util"
 )
 
@@ -484,5 +485,126 @@ func TestRouterPreservesPrepareClientError(t *testing.T) {
 	}
 	if gatewayError.Status != 400 || gatewayError.Code != "invalid_body" {
 		t.Fatalf("error = %+v", gatewayError)
+	}
+}
+
+// Upstream request headers.
+
+func TestRouterUpstreamHeaders(t *testing.T) {
+	t.Parallel()
+
+	var captured atomic.Value
+	server := upstream(t, func(w http.ResponseWriter, r *http.Request) {
+		captured.Store(r.Header.Clone())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	openAI := testProvider("openai", server.URL, "/chat/completions")
+	openAI.APIKey = "sk-test"
+	openAI.Headers = map[string]string{"x-extra": "1", "Authorization": "Custom token"}
+
+	anthropicProvider := testProvider("anthropic", server.URL, "/v1/messages")
+	anthropicProvider.APIKey = "ak-test"
+
+	modelFor := func(providerID string) *Model {
+		return &Model{ID: "m", Providers: []ModelProvider{{ProviderID: providerID, UpstreamModel: "u"}}}
+	}
+
+	openAIModel := modelFor("openai")
+	openAIRouter, _ := NewRouter(testConfig([]*Provider{openAI}, openAIModel), WithSleep(noSleep))
+	defer openAIRouter.Close()
+	result, err := send(t.Context(), openAIRouter, openAIModel, textRequest("hi"), nil, "", "chat_completions")
+	if err != nil {
+		t.Fatalf("openai send: %v", err)
+	}
+	_ = result.Close()
+
+	headers := captured.Load().(http.Header)
+	if headers.Get("Authorization") != "Custom token" {
+		t.Fatalf("provider headers must win: %q", headers.Get("Authorization"))
+	}
+	if headers.Get("x-extra") != "1" {
+		t.Fatalf("extra header missing: %v", headers)
+	}
+	if headers.Get("User-Agent") != "llm-proxy/"+core.Value {
+		t.Fatalf("user agent = %q", headers.Get("User-Agent"))
+	}
+	if headers.Get("Accept") != "application/json" {
+		t.Fatalf("accept = %q", headers.Get("Accept"))
+	}
+
+	anthropicModel := modelFor("anthropic")
+	anthropicRouter, _ := NewRouter(testConfig([]*Provider{anthropicProvider}, anthropicModel), WithSleep(noSleep))
+	defer anthropicRouter.Close()
+	result, err = send(t.Context(), anthropicRouter, anthropicModel, textRequest("hi"),
+		map[string]string{"anthropic-version": "2024-01-01", "anthropic-beta": "beta-1"}, "", "messages")
+	if err != nil {
+		t.Fatalf("anthropic send: %v", err)
+	}
+	_ = result.Close()
+
+	headers = captured.Load().(http.Header)
+	if headers.Get("x-api-key") != "ak-test" {
+		t.Fatalf("x-api-key = %q", headers.Get("x-api-key"))
+	}
+	if headers.Get("anthropic-version") != "2024-01-01" || headers.Get("anthropic-beta") != "beta-1" {
+		t.Fatalf("anthropic headers = %v", headers)
+	}
+	if headers.Get("Authorization") != "" {
+		t.Fatalf("unexpected authorization header: %q", headers.Get("Authorization"))
+	}
+
+	// A stream request advertises SSE.
+	streamPayload := textRequest("hi")
+	streamPayload["stream"] = true
+	result, err = send(t.Context(), anthropicRouter, anthropicModel, streamPayload, nil, "", "messages")
+	if err != nil {
+		t.Fatalf("stream send: %v", err)
+	}
+	_ = result.Close()
+	headers = captured.Load().(http.Header)
+	if headers.Get("Accept") != "text/event-stream" {
+		t.Fatalf("stream accept = %q", headers.Get("Accept"))
+	}
+}
+
+// Compatibility regressions.
+
+// Anthropic reports overload as HTTP 529. Gateways retry it and fail over
+// because it is a provider-side capacity error, not a client error.
+func TestCompatRetriesOverloaded529(t *testing.T) {
+	t.Parallel()
+
+	busy := upstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(529)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`))
+	})
+	live := upstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+
+	busyProvider := testProvider("p1", busy.URL, "/chat/completions")
+	busyProvider.MaxRetries = 0
+	liveProvider := testProvider("p2", live.URL, "/chat/completions")
+	model := &Model{ID: "m", Providers: []ModelProvider{
+		{ProviderID: "p1", UpstreamModel: "u1"},
+		{ProviderID: "p2", UpstreamModel: "u2"},
+	}}
+
+	router, err := NewRouter(testConfig([]*Provider{busyProvider, liveProvider}, model),
+		WithRand(func() float64 { return 0 }), WithSleep(noSleep))
+	if err != nil {
+		t.Fatalf("new router: %v", err)
+	}
+	defer router.Close()
+
+	result, err := send(t.Context(), router, model, textRequest("hi"), nil, "", "chat_completions")
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	defer result.Close()
+	if result.ProviderID != "p2" {
+		t.Fatalf("529 was not retried/failed over: provider=%q status=%d", result.ProviderID, result.Status)
 	}
 }

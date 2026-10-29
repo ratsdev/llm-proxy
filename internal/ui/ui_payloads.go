@@ -9,42 +9,42 @@ import (
 	"github.com/ratsdev/llm-proxy/internal/util"
 )
 
-func (h *Handler) handleUIListModels(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleListModels(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdmin(w, r); !ok {
 		return
 	}
 	cfg := h.config()
-	models := uiModels(cfg)
+	models := catalogModels(cfg)
 	payloads := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		payloads = append(payloads, uiModelPayload(model, cfg))
+		payloads = append(payloads, modelPayload(model, cfg))
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{"models": payloads})
+	writeJSON(w, http.StatusOK, map[string]any{"models": payloads})
 }
 
-// handleUICatalog lists the models the signed-in account may call. Unlike the
+// handleCatalog lists the models the signed-in account may call. Unlike the
 // administrator model view it never exposes provider bindings, so members can
 // see what their allow-list unlocks without learning upstream routing details.
-func (h *Handler) handleUICatalog(w http.ResponseWriter, r *http.Request) {
-	user, _, ok := h.requireUIUser(w, r)
+func (h *Handler) handleCatalog(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := h.requireUser(w, r)
 	if !ok {
 		return
 	}
 	cfg := h.config()
 	models := make([]map[string]any, 0, len(cfg.Models))
-	for _, model := range uiModels(cfg) {
+	for _, model := range catalogModels(cfg) {
 		if !user.CanUse(model.ID) {
 			continue
 		}
-		models = append(models, uiCatalogModelPayload(model))
+		models = append(models, catalogModelPayload(model))
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"models": models,
 		"total":  len(cfg.Models),
 	})
 }
 
-func (h *Handler) handleUIListProviders(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleListProviders(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdmin(w, r); !ok {
 		return
 	}
@@ -59,12 +59,12 @@ func (h *Handler) handleUIListProviders(w http.ResponseWriter, r *http.Request) 
 	payloads := make([]map[string]any, 0, len(providerIDs))
 	for _, id := range providerIDs {
 		provider := cfg.Providers[id]
-		payloads = append(payloads, uiProviderPayload(provider, modelsByProvider[id], h.defaultTimeout))
+		payloads = append(payloads, providerPayload(provider, modelsByProvider[id], h.defaultTimeout))
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{"providers": payloads})
+	writeJSON(w, http.StatusOK, map[string]any{"providers": payloads})
 }
 
-func uiModels(cfg *Config) []*Model {
+func catalogModels(cfg *Config) []*Model {
 	models := make([]*Model, 0, len(cfg.Models))
 	for _, model := range cfg.Models {
 		models = append(models, model)
@@ -73,7 +73,7 @@ func uiModels(cfg *Config) []*Model {
 	return models
 }
 
-func uiModelPayload(model *Model, cfg *Config) map[string]any {
+func modelPayload(model *Model, cfg *Config) map[string]any {
 	bindings := make([]map[string]any, 0, len(model.Providers))
 	for _, binding := range model.Providers {
 		provider, ok := cfg.Providers[binding.ProviderID]
@@ -105,9 +105,9 @@ func uiModelPayload(model *Model, cfg *Config) map[string]any {
 	}
 }
 
-// uiCatalogModelPayload is the member-facing model shape. It deliberately
+// catalogModelPayload is the member-facing model shape. It deliberately
 // omits binding order and upstream identifiers.
-func uiCatalogModelPayload(model *Model) map[string]any {
+func catalogModelPayload(model *Model) map[string]any {
 	return map[string]any{
 		"id":                model.ID,
 		"name":              model.Name,
@@ -121,7 +121,7 @@ func uiCatalogModelPayload(model *Model) map[string]any {
 	}
 }
 
-func uiProviderPayload(provider *Provider, models []*Model, defaultTimeout time.Duration) map[string]any {
+func providerPayload(provider *Provider, models []*Model, defaultTimeout time.Duration) map[string]any {
 	proxyScheme := ""
 	if provider.Proxy != "" {
 		if parsed, err := url.Parse(provider.Proxy); err == nil {

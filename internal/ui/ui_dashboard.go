@@ -33,7 +33,7 @@ type RequestRecord struct {
 	TotalTokens  int   `json:"total_tokens"`
 }
 
-type uiBreakdown struct {
+type breakdown struct {
 	Name          string  `json:"name"`
 	Requests      int     `json:"requests"`
 	Errors        int     `json:"errors"`
@@ -42,10 +42,10 @@ type uiBreakdown struct {
 	AvgTTFTMS     float64 `json:"avg_ttft_ms"`
 	AvgOutputTPS  float64 `json:"avg_output_tps"`
 
-	timing uiTiming
+	timing latency
 }
 
-type uiSummary struct {
+type requestSummary struct {
 	Requests      int     `json:"requests"`
 	Errors        int     `json:"errors"`
 	Success       int     `json:"success"`
@@ -57,21 +57,21 @@ type uiSummary struct {
 	AvgTTFTMS     float64 `json:"avg_ttft_ms"`
 	AvgOutputTPS  float64 `json:"avg_output_tps"`
 
-	timing uiTiming
+	timing latency
 }
 
-// uiTiming accumulates streaming latency samples. Time-to-first-token and the
+// latency accumulates streaming latency samples. Time-to-first-token and the
 // decode rate only make sense while a reply is generated incrementally: a
 // buffered JSON reply arrives as one write, so the gateway records no TTFT for
 // it and these accumulators skip records without one.
-type uiTiming struct {
+type latency struct {
 	ttftMS    int64
 	ttftCount int
 	genTokens int
 	genTimeMS int64
 }
 
-func (t *uiTiming) add(record RequestRecord) {
+func (t *latency) add(record RequestRecord) {
 	if record.Status >= http.StatusBadRequest {
 		return
 	}
@@ -88,7 +88,7 @@ func (t *uiTiming) add(record RequestRecord) {
 
 // avgTTFT returns the mean time-to-first-token in milliseconds, or zero when
 // the window holds no streaming sample.
-func (t uiTiming) avgTTFT() float64 {
+func (t latency) avgTTFT() float64 {
 	if t.ttftCount == 0 {
 		return 0
 	}
@@ -98,14 +98,14 @@ func (t uiTiming) avgTTFT() float64 {
 // outputTPS returns the window's weighted decode throughput: total output
 // tokens divided by the time spent streaming them, excluding the wait for the
 // first token. Zero means no usable sample.
-func (t uiTiming) outputTPS() float64 {
+func (t latency) outputTPS() float64 {
 	if t.genTimeMS <= 0 || t.genTokens == 0 {
 		return 0
 	}
 	return float64(t.genTokens) / (float64(t.genTimeMS) / 1000)
 }
 
-type uiBucket struct {
+type seriesBucket struct {
 	Start       time.Time `json:"start"`
 	Requests    int       `json:"requests"`
 	Errors      int       `json:"errors"`
@@ -113,29 +113,29 @@ type uiBucket struct {
 }
 
 // recordRequest appends one completed request to the bounded history window.
-func (u *uiState) recordRequest(record RequestRecord) {
+func (u *state) recordRequest(record RequestRecord) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if len(u.records) < uiHistorySize {
+	if len(u.records) < historySize {
 		u.records = append(u.records, record)
 		return
 	}
 	u.records[u.next] = record
-	u.next = (u.next + 1) % uiHistorySize
+	u.next = (u.next + 1) % historySize
 }
 
 // historyFull reports whether the shared window has started evicting records.
-func (u *uiState) historyFull() bool {
+func (u *state) historyFull() bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	return len(u.records) >= uiHistorySize
+	return len(u.records) >= historySize
 }
 
 // snapshotRecords returns the shared request history newest-first. A non-empty
 // userID keeps only that account's records, which is what a member sees; the
 // filter runs while collecting, so the caller never copies traffic it may not
 // read.
-func (u *uiState) snapshotRecords(userID string) []RequestRecord {
+func (u *state) snapshotRecords(userID string) []RequestRecord {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -151,14 +151,14 @@ func (u *uiState) snapshotRecords(userID string) []RequestRecord {
 	return out
 }
 
-func (h *Handler) handleUIOverview(w http.ResponseWriter, r *http.Request) {
-	user, _, ok := h.requireUIUser(w, r)
+func (h *Handler) handleOverview(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := h.requireUser(w, r)
 	if !ok {
 		return
 	}
 
-	records := h.uiRecordsFor(user)
-	summary, series, byModel, byProvider := summarizeUI(records, time.Now())
+	records := h.recordsFor(user)
+	summary, series, byModel, byProvider := summarize(records, time.Now())
 	recent := records
 	if len(recent) > 8 {
 		recent = recent[:8]
@@ -188,39 +188,39 @@ func (h *Handler) handleUIOverview(w http.ResponseWriter, r *http.Request) {
 		"summary":  summary,
 		"series":   series,
 		"by_model": byModel,
-		"recent":   uiRequestPayloads(recent, user.IsAdmin),
+		"recent":   requestPayloads(recent, user.IsAdmin),
 		"history": map[string]any{
 			"size":     len(records),
-			"capacity": uiHistorySize,
+			"capacity": historySize,
 			"full":     h.ui.historyFull(),
 		},
 	}
 	if user.IsAdmin {
 		payload["by_provider"] = byProvider
 	}
-	writeUIJSON(w, http.StatusOK, payload)
+	writeJSON(w, http.StatusOK, payload)
 }
 
-// uiRecordsFor scopes the in-memory request window to what the caller may see.
+// recordsFor scopes the in-memory request window to what the caller may see.
 // Administrators see every account; members see only their own requests.
-func (h *Handler) uiRecordsFor(user *User) []RequestRecord {
+func (h *Handler) recordsFor(user *User) []RequestRecord {
 	if user.IsAdmin {
 		return h.ui.snapshotRecords("")
 	}
 	return h.ui.snapshotRecords(user.ID)
 }
 
-func uiRequestPayloads(records []RequestRecord, includeProvider bool) []map[string]any {
+func requestPayloads(records []RequestRecord, includeProvider bool) []map[string]any {
 	out := make([]map[string]any, 0, len(records))
 	for _, record := range records {
-		out = append(out, uiRequestPayload(record, includeProvider))
+		out = append(out, requestPayload(record, includeProvider))
 	}
 	return out
 }
 
-// uiRequestPayload renders one record. Provider names, upstream model IDs and
+// requestPayload renders one record. Provider names, upstream model IDs and
 // provider IDs are administrator-only; members see only their own traffic.
-func uiRequestPayload(record RequestRecord, includeProvider bool) map[string]any {
+func requestPayload(record RequestRecord, includeProvider bool) map[string]any {
 	payload := map[string]any{
 		"time":          record.Time,
 		"request_id":    record.RequestID,
@@ -245,15 +245,15 @@ func uiRequestPayload(record RequestRecord, includeProvider bool) map[string]any
 	return payload
 }
 
-func (h *Handler) handleUIRequests(w http.ResponseWriter, r *http.Request) {
-	user, _, ok := h.requireUIUser(w, r)
+func (h *Handler) handleRequests(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := h.requireUser(w, r)
 	if !ok {
 		return
 	}
 
-	limit := parseUIInt(r.URL.Query().Get("limit"), uiDefaultLimit, 1, uiMaxLimit)
-	offset := parseUIInt(r.URL.Query().Get("offset"), 0, 0, uiHistorySize)
-	records := h.uiRecordsFor(user)
+	limit := parseInt(r.URL.Query().Get("limit"), defaultLimit, 1, maxLimit)
+	offset := parseInt(r.URL.Query().Get("offset"), 0, 0, historySize)
+	records := h.recordsFor(user)
 	total := len(records)
 	if offset >= total {
 		records = nil
@@ -263,25 +263,25 @@ func (h *Handler) handleUIRequests(w http.ResponseWriter, r *http.Request) {
 			records = records[:limit]
 		}
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"total":    total,
 		"offset":   offset,
 		"limit":    limit,
-		"capacity": uiHistorySize,
-		"records":  uiRequestPayloads(records, user.IsAdmin),
+		"capacity": historySize,
+		"records":  requestPayloads(records, user.IsAdmin),
 	})
 }
 
-func summarizeUI(records []RequestRecord, now time.Time) (uiSummary, []uiBucket, []uiBreakdown, []uiBreakdown) {
+func summarize(records []RequestRecord, now time.Time) (requestSummary, []seriesBucket, []breakdown, []breakdown) {
 	start := now.Truncate(time.Hour).Add(-23 * time.Hour)
-	buckets := make([]uiBucket, 24)
+	buckets := make([]seriesBucket, 24)
 	for index := range buckets {
 		buckets[index].Start = start.Add(time.Duration(index) * time.Hour)
 	}
 
-	summary := uiSummary{Requests: len(records)}
-	modelStats := make(map[string]*uiBreakdown)
-	providerStats := make(map[string]*uiBreakdown)
+	summary := requestSummary{Requests: len(records)}
+	modelStats := make(map[string]*breakdown)
+	providerStats := make(map[string]*breakdown)
 	var totalDuration int64
 
 	for _, record := range records {
@@ -322,7 +322,7 @@ func summarizeUI(records []RequestRecord, now time.Time) (uiSummary, []uiBucket,
 // addBreakdown aggregates by canonical ID while labeling the group with the
 // human-readable name, so two entries that share a name stay separate. An empty
 // ID falls back to emptyLabel so the row is still identifiable.
-func addBreakdown(stats map[string]*uiBreakdown, id, name, emptyLabel string, record RequestRecord) {
+func addBreakdown(stats map[string]*breakdown, id, name, emptyLabel string, record RequestRecord) {
 	if id == "" {
 		id = emptyLabel
 	}
@@ -331,7 +331,7 @@ func addBreakdown(stats map[string]*uiBreakdown, id, name, emptyLabel string, re
 	}
 	entry, ok := stats[id]
 	if !ok {
-		entry = &uiBreakdown{Name: name}
+		entry = &breakdown{Name: name}
 		stats[id] = entry
 	}
 	entry.Requests++
@@ -343,8 +343,8 @@ func addBreakdown(stats map[string]*uiBreakdown, id, name, emptyLabel string, re
 	}
 }
 
-func sortedBreakdowns(stats map[string]*uiBreakdown) []uiBreakdown {
-	out := make([]uiBreakdown, 0, len(stats))
+func sortedBreakdowns(stats map[string]*breakdown) []breakdown {
+	out := make([]breakdown, 0, len(stats))
 	for _, entry := range stats {
 		if entry.Requests > 0 {
 			entry.AvgDurationMS /= float64(entry.Requests)

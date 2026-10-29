@@ -1,5 +1,3 @@
-// Package openai implements the OpenAI Chat Completions and Responses wire
-// formats.
 package openai
 
 import (

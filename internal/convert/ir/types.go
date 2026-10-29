@@ -1,10 +1,6 @@
-// Package ir defines the protocol-neutral intermediate representation shared by
-// every wire-format adapter.
-//
-// Every inbound protocol parses into these types and every outbound protocol
-// formats from them, so adding a protocol means writing one adapter rather
-// than pairwise conversion logic.
 package ir
+
+import "strings"
 
 // Content block types.
 const (
@@ -122,4 +118,26 @@ type StreamEvent struct {
 	Usage        *Usage
 	Error        string
 	ErrorType    string
+}
+
+// Content block builders and helpers.
+
+// ToolBlockIndexBase offsets streamed tool blocks so they do not collide with
+// the fixed text (0) and thinking (1) IR indexes used by the OpenAI adapters.
+const ToolBlockIndexBase = 1000
+
+// TextBlock builds a text content block.
+func TextBlock(text string) Block {
+	return Block{Type: Text, Text: text}
+}
+
+// JoinText joins the non-empty text blocks with newlines.
+func JoinText(blocks []Block) string {
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Type == Text && block.Text != "" {
+			parts = append(parts, block.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }

@@ -553,3 +553,33 @@ func TestFormatBlockRedactedAndImages(t *testing.T) {
 		t.Fatal("unsigned thinking must be dropped on replay")
 	}
 }
+
+// Shared test helpers.
+
+// decodeJSON parses a JSON object literal, failing the test on bad input.
+func decodeJSON(t *testing.T, data string) map[string]any {
+	t.Helper()
+	value, err := util.Decode([]byte(data))
+	if err != nil {
+		t.Fatalf("decode %q: %v", data, err)
+	}
+	object, ok := util.AsMap(value)
+	if !ok {
+		t.Fatalf("expected JSON object, got %T", value)
+	}
+	return object
+}
+
+// framePayload decodes the data payload of one encoded SSE frame.
+func framePayload(t *testing.T, frame []byte) map[string]any {
+	t.Helper()
+	text := string(frame)
+	const marker = "data: "
+	index := strings.Index(text, marker)
+	if index < 0 {
+		t.Fatalf("unexpected frame %q", text)
+	}
+	return decodeJSON(t, strings.TrimSuffix(text[index+len(marker):], "\n\n"))
+}
+
+func floatPtr(value float64) *float64 { return &value }

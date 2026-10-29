@@ -6,7 +6,7 @@ import (
 	"github.com/ratsdev/llm-proxy/internal/util"
 )
 
-func (h *Handler) handleUIListKeys(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleListKeys(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.requireUIUserStore(w, r)
 	if !ok {
 		return
@@ -16,10 +16,10 @@ func (h *Handler) handleUIListKeys(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{"keys": keys})
+	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
 }
 
-func (h *Handler) handleUICreateKey(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.requireUIUserStore(w, r)
 	if !ok {
 		return
@@ -36,7 +36,7 @@ func (h *Handler) handleUICreateKey(w http.ResponseWriter, r *http.Request) {
 	h.saveAndReload(w, "API key created.", map[string]any{"key": key})
 }
 
-func (h *Handler) handleUIDeleteKey(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.requireUIUserStore(w, r)
 	if !ok {
 		return

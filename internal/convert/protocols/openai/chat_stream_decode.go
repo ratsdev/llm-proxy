@@ -202,7 +202,7 @@ func (d *chatDecoder) Feed(event, data string) ([]ir.StreamEvent, error) {
 				}
 				function, _ := util.AsMap(callMap["function"])
 				rawIndex := d.resolveToolIndex(callMap, util.StringValue(function["name"]))
-				index := protocols.ToolBlockIndexBase + rawIndex
+				index := ir.ToolBlockIndexBase + rawIndex
 				if !d.toolOpen[index] {
 					d.toolOpen[index] = true
 					d.lastTool = rawIndex

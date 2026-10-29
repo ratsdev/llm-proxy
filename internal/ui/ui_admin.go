@@ -12,15 +12,15 @@ import (
 	"github.com/ratsdev/llm-proxy/internal/util"
 )
 
-const uiMaxAdminBody = 1 << 20
+const maxAdminBody = 1 << 20
 
 func (h *Handler) requireUIAdmin(w http.ResponseWriter, r *http.Request) (*User, bool) {
-	user, _, ok := h.requireUIUser(w, r)
+	user, _, ok := h.requireUser(w, r)
 	if !ok {
 		return nil, false
 	}
 	if !user.IsAdmin {
-		writeUIError(w, http.StatusForbidden, "Administrator access is required.", "forbidden")
+		writeError(w, http.StatusForbidden, "Administrator access is required.", "forbidden")
 		return nil, false
 	}
 	return user, true
@@ -29,12 +29,12 @@ func (h *Handler) requireUIAdmin(w http.ResponseWriter, r *http.Request) (*User,
 // requireUIUserStore requires the signed-in account and the persistent
 // configuration store, which every account-scoped write and key operation needs.
 func (h *Handler) requireUIUserStore(w http.ResponseWriter, r *http.Request) (*User, bool) {
-	user, _, ok := h.requireUIUser(w, r)
+	user, _, ok := h.requireUser(w, r)
 	if !ok {
 		return nil, false
 	}
 	if h.store == nil {
-		writeUIError(w, http.StatusServiceUnavailable, "The configuration store is unavailable.", "store_unavailable")
+		writeError(w, http.StatusServiceUnavailable, "The configuration store is unavailable.", "store_unavailable")
 		return nil, false
 	}
 	return user, true
@@ -47,7 +47,7 @@ func (h *Handler) requireUIAdminStore(w http.ResponseWriter, r *http.Request) (*
 		return nil, false
 	}
 	if !user.IsAdmin {
-		writeUIError(w, http.StatusForbidden, "Administrator access is required.", "forbidden")
+		writeError(w, http.StatusForbidden, "Administrator access is required.", "forbidden")
 		return nil, false
 	}
 	return user, true
@@ -61,22 +61,22 @@ func (h *Handler) afterChange() error {
 }
 
 func readUIObject(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
-	return readUIObjectLimited(w, r, uiMaxAdminBody)
+	return readObjectLimited(w, r, maxAdminBody)
 }
 
-// readUIObjectLimited decodes a console JSON body. Callers choose the limit so
+// readObjectLimited decodes a console JSON body. Callers choose the limit so
 // sign-in and registration stay small without loosening administrative writes.
-func readUIObjectLimited(w http.ResponseWriter, r *http.Request, limit int64) (map[string]any, bool) {
+func readObjectLimited(w http.ResponseWriter, r *http.Request, limit int64) (map[string]any, bool) {
 	object, err := util.ReadJSONObject(w, r, limit)
 	switch {
 	case err == nil:
 		return object, true
 	case errors.Is(err, util.ErrBodyTooLarge):
-		writeUIError(w, http.StatusRequestEntityTooLarge, "Request body is too large.", "invalid_body")
+		writeError(w, http.StatusRequestEntityTooLarge, "Request body is too large.", "invalid_body")
 	case errors.Is(err, util.ErrBodyUnreadable):
-		writeUIError(w, http.StatusBadRequest, "Could not read the request body.", "invalid_body")
+		writeError(w, http.StatusBadRequest, "Could not read the request body.", "invalid_body")
 	default:
-		writeUIError(w, http.StatusBadRequest, "Request body must be a JSON object.", "invalid_json")
+		writeError(w, http.StatusBadRequest, "Request body must be a JSON object.", "invalid_json")
 	}
 	return nil, false
 }
@@ -85,11 +85,11 @@ func decodeUI[T any](w http.ResponseWriter, object map[string]any) (T, bool) {
 	var target T
 	encoded, err := util.Marshal(object)
 	if err != nil {
-		writeUIError(w, http.StatusBadRequest, "Request body could not be encoded.", "invalid_body")
+		writeError(w, http.StatusBadRequest, "Request body could not be encoded.", "invalid_body")
 		return target, false
 	}
 	if err := json.Unmarshal(encoded, &target); err != nil {
-		writeUIError(w, http.StatusBadRequest, "Request body has the wrong shape.", "invalid_body")
+		writeError(w, http.StatusBadRequest, "Request body has the wrong shape.", "invalid_body")
 		return target, false
 	}
 	return target, true
@@ -97,7 +97,7 @@ func decodeUI[T any](w http.ResponseWriter, object map[string]any) (T, bool) {
 
 func (h *Handler) saveAndReload(w http.ResponseWriter, message string, payload map[string]any) {
 	if err := h.afterChange(); err != nil {
-		writeUIError(w, http.StatusInternalServerError,
+		writeError(w, http.StatusInternalServerError,
 			"The configuration was saved but could not be activated: "+err.Error(), "reload_failed")
 		return
 	}
@@ -108,15 +108,15 @@ func (h *Handler) saveAndReload(w http.ResponseWriter, message string, payload m
 	if message != "" {
 		payload["message"] = message
 	}
-	writeUIJSON(w, http.StatusOK, payload)
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func writeStoreError(w http.ResponseWriter, err error) {
 	if errors.Is(err, ErrNotFound) {
-		writeUIError(w, http.StatusNotFound, "Not found.", "not_found")
+		writeError(w, http.StatusNotFound, "Not found.", "not_found")
 		return
 	}
-	writeUIError(w, http.StatusBadRequest, err.Error(), "invalid_configuration")
+	writeError(w, http.StatusBadRequest, err.Error(), "invalid_configuration")
 }
 
 // writeRegistrationError maps account-registration failures onto the statuses
@@ -128,19 +128,19 @@ func writeStoreError(w http.ResponseWriter, err error) {
 func writeRegistrationError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, core.ErrAdminExists):
-		writeUIError(w, http.StatusConflict, "The console is already set up. Sign in instead.", "registration_closed")
+		writeError(w, http.StatusConflict, "The console is already set up. Sign in instead.", "registration_closed")
 	case errors.Is(err, core.ErrUserIDTaken):
-		writeUIError(w, http.StatusConflict,
+		writeError(w, http.StatusConflict,
 			"The account could not be created. Sign in if you already have an account.", "registration_failed")
 	default:
 		slog.Error("console registration failed", "error", err)
-		writeUIError(w, http.StatusInternalServerError, "The account could not be created.", "internal_error")
+		writeError(w, http.StatusInternalServerError, "The account could not be created.", "internal_error")
 	}
 }
 
 // ---------------------------------------------------------------- providers
 
-func (h *Handler) handleUIGetProvider(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleGetProvider(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -149,10 +149,10 @@ func (h *Handler) handleUIGetProvider(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{"provider": input})
+	writeJSON(w, http.StatusOK, map[string]any{"provider": input})
 }
 
-func (h *Handler) handleUISaveProvider(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleSaveProvider(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -175,7 +175,7 @@ func (h *Handler) handleUISaveProvider(w http.ResponseWriter, r *http.Request) {
 	h.saveAndReload(w, "Provider saved.", map[string]any{"provider": saved})
 }
 
-func (h *Handler) handleUIDeleteProvider(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -188,7 +188,7 @@ func (h *Handler) handleUIDeleteProvider(w http.ResponseWriter, r *http.Request)
 
 // ------------------------------------------------------------------- models
 
-func (h *Handler) handleUIGetModel(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleGetModel(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -197,10 +197,10 @@ func (h *Handler) handleUIGetModel(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{"model": input})
+	writeJSON(w, http.StatusOK, map[string]any{"model": input})
 }
 
-func (h *Handler) handleUISaveModel(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleSaveModel(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -223,7 +223,7 @@ func (h *Handler) handleUISaveModel(w http.ResponseWriter, r *http.Request) {
 	h.saveAndReload(w, "Model saved.", map[string]any{"model": saved})
 }
 
-func (h *Handler) handleUIDeleteModel(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleDeleteModel(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -236,7 +236,7 @@ func (h *Handler) handleUIDeleteModel(w http.ResponseWriter, r *http.Request) {
 
 // -------------------------------------------------------------------- users
 
-func (h *Handler) handleUIListUsers(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleListUsers(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -245,10 +245,10 @@ func (h *Handler) handleUIListUsers(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{"users": users})
+	writeJSON(w, http.StatusOK, map[string]any{"users": users})
 }
 
-func (h *Handler) handleUIGetUser(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleGetUser(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -257,10 +257,10 @@ func (h *Handler) handleUIGetUser(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{"user": user})
+	writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
-func (h *Handler) handleUISaveUser(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleSaveUser(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -283,7 +283,7 @@ func (h *Handler) handleUISaveUser(w http.ResponseWriter, r *http.Request) {
 	h.saveAndReload(w, "User saved.", map[string]any{"user": saved})
 }
 
-func (h *Handler) handleUIDeleteUser(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -296,7 +296,7 @@ func (h *Handler) handleUIDeleteUser(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- settings
 
-func (h *Handler) handleUIGetSettings(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -305,10 +305,10 @@ func (h *Handler) handleUIGetSettings(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{"settings": settings})
+	writeJSON(w, http.StatusOK, map[string]any{"settings": settings})
 }
 
-func (h *Handler) handleUISaveSettings(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdminStore(w, r); !ok {
 		return
 	}
@@ -330,13 +330,13 @@ func (h *Handler) handleUISaveSettings(w http.ResponseWriter, r *http.Request) {
 
 // ----------------------------------------------------------------- password
 
-func (h *Handler) handleUIChangePassword(w http.ResponseWriter, r *http.Request) {
-	user, _, ok := h.requireUIUser(w, r)
+func (h *Handler) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := h.requireUser(w, r)
 	if !ok {
 		return
 	}
 	if h.store == nil {
-		writeUIError(w, http.StatusServiceUnavailable, "The configuration store is unavailable.", "store_unavailable")
+		writeError(w, http.StatusServiceUnavailable, "The configuration store is unavailable.", "store_unavailable")
 		return
 	}
 	object, ok := readUIObject(w, r)
@@ -346,11 +346,11 @@ func (h *Handler) handleUIChangePassword(w http.ResponseWriter, r *http.Request)
 	current := util.StringValue(object["current_password"])
 	next := util.StringValue(object["new_password"])
 	if !core.VerifyPassword(user.PasswordHash, current) {
-		writeUIError(w, http.StatusUnauthorized, "The current password isn't valid.", "invalid_password")
+		writeError(w, http.StatusUnauthorized, "The current password isn't valid.", "invalid_password")
 		return
 	}
 	if len(next) < core.MinPasswordLength {
-		writeUIError(w, http.StatusBadRequest, fmt.Sprintf("The new password must be at least %d characters.", core.MinPasswordLength), "weak_password")
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("The new password must be at least %d characters.", core.MinPasswordLength), "weak_password")
 		return
 	}
 	if err := h.store.SetPassword(user.ID, next); err != nil {
@@ -364,7 +364,7 @@ func (h *Handler) handleUIChangePassword(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) currentSessionToken(r *http.Request) string {
-	cookie, err := r.Cookie(uiSessionCookie)
+	cookie, err := r.Cookie(sessionCookie)
 	if err != nil {
 		return ""
 	}
@@ -373,7 +373,7 @@ func (h *Handler) currentSessionToken(r *http.Request) string {
 
 // --------------------------------------------------------------- converters
 
-func (h *Handler) handleUIConverters(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleConverters(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireUIAdmin(w, r); !ok {
 		return
 	}
@@ -381,7 +381,7 @@ func (h *Handler) handleUIConverters(w http.ResponseWriter, r *http.Request) {
 	for _, format := range convert.Formats() {
 		formats = append(formats, string(format))
 	}
-	writeUIJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"formats":    formats,
 		"converters": convert.Definitions(),
 		"policy":     "Converters are configured per endpoint. Choose \"none\" to forward the client protocol unchanged; cross-protocol converters map requests, responses and SSE events.",

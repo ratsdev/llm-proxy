@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/ratsdev/llm-proxy/internal/convert"
-	"github.com/ratsdev/llm-proxy/internal/ui"
 	"github.com/ratsdev/llm-proxy/internal/util"
 )
 
@@ -260,48 +259,4 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 type requestTiming struct {
 	elapsed time.Duration
 	ttftMS  int64
-}
-
-// recordUIRequest feeds the in-memory dashboard window. Only model requests
-// reach this path, so health probes and the Web UI itself stay out of the
-// traffic statistics.
-func (s *Server) recordUIRequest(log *requestLog, started time.Time, timing requestTiming, status int) {
-	record := ui.RequestRecord{
-		Time:          started.UTC(),
-		RequestID:     log.requestID,
-		User:          log.user,
-		Model:         log.model,
-		ModelName:     s.displayModelName(log.model),
-		Provider:      log.provider,
-		ProviderName:  s.displayProviderName(log.provider),
-		UpstreamModel: log.upstreamModel,
-		Inbound:       string(log.inbound),
-		Upstream:      string(log.upstream),
-		Stream:        log.stream,
-		Status:        status,
-		DurationMS:    timing.elapsed.Milliseconds(),
-	}
-	if log.usage != nil {
-		record.InputTokens = log.usage.PromptTokens()
-		record.OutputTokens = log.usage.OutputTokens
-		record.TotalTokens = log.usage.TotalTokens()
-	}
-	if log.streamed {
-		record.TTFTMS = timing.ttftMS
-	}
-	s.ui.RecordRequest(record)
-}
-
-func (s *Server) displayModelName(id string) string {
-	if model, ok := s.cfg.Models[id]; ok && model.Name != "" {
-		return model.Name
-	}
-	return id
-}
-
-func (s *Server) displayProviderName(id string) string {
-	if provider, ok := s.cfg.Providers[id]; ok && provider.Name != "" {
-		return provider.Name
-	}
-	return id
 }

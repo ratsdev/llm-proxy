@@ -2,29 +2,32 @@ package ui
 
 import (
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ratsdev/llm-proxy/internal/core"
+	"github.com/ratsdev/llm-proxy/internal/util"
 )
 
 const (
 	// RootPath is the console page.
-	RootPath        = "/"
-	uiAssetsPath    = "/assets/"
-	uiAPIPath       = core.APIPrefix + "/ui"
-	uiAPIPrefix     = uiAPIPath + "/"
-	uiSessionCookie = "llm_proxy_ui_session"
-	uiSessionTTL    = 12 * time.Hour
-	uiMaxSessions   = 2048
-	uiMaxLoginBody  = 8 << 10
-	uiHistorySize   = 5000
-	uiDefaultLimit  = 200
-	uiMaxLimit      = 1000
-	uiNoStore       = "no-store"
+	RootPath      = "/"
+	assetsPath    = "/assets/"
+	apiPath       = core.APIPrefix + "/ui"
+	apiPrefix     = apiPath + "/"
+	sessionCookie = "llm_proxy_ui_session"
+	sessionTTL    = 12 * time.Hour
+	maxSessions   = 2048
+	maxLoginBody  = 8 << 10
+	historySize   = 5000
+	defaultLimit  = 200
+	maxLimit      = 1000
+	noStore       = "no-store"
 )
 
-const uiDisabledMessage = "Console access isn't configured for this deployment. Ask your administrator to enable it."
+const disabledMessage = "Console access isn't configured for this deployment. Ask your administrator to enable it."
 
 // Options configures the console handler. Config is called on every request so
 // a running handler observes hot-reloaded gateway configuration.
@@ -50,7 +53,7 @@ type Handler struct {
 	version        string
 	defaultTimeout time.Duration
 	onLogin        func(*http.Request, string)
-	ui             *uiState
+	ui             *state
 	logins         *attemptLimiter
 	registrations  *attemptLimiter
 
@@ -76,9 +79,9 @@ func New(opts Options) *Handler {
 		version:        opts.Version,
 		defaultTimeout: opts.DefaultTimeout,
 		onLogin:        opts.LogLogin,
-		ui:             newUIState(),
-		logins:         newAttemptLimiter(uiLoginMaxFailures, uiLoginWindow),
-		registrations:  newAttemptLimiter(uiRegisterMaxAttempts, uiRegisterWindow),
+		ui:             newState(),
+		logins:         newAttemptLimiter(loginMaxFailures, loginWindow),
+		registrations:  newAttemptLimiter(registerMaxAttempts, registerWindow),
 	}
 }
 
@@ -120,48 +123,95 @@ func (h *Handler) usersByID() map[string]*User {
 
 // Register mounts the console page, its assets and the JSON API.
 func (h *Handler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /{$}", h.handleUIPage)
-	mux.Handle("GET "+uiAssetsPath, http.StripPrefix(uiAssetsPath, uiAssetHandler()))
-	mux.HandleFunc("GET "+uiAPIPrefix+"session", h.handleUISession)
-	mux.HandleFunc("GET "+uiAPIPrefix+"registration", h.handleUIRegistrationStatus)
-	mux.HandleFunc("POST "+uiAPIPrefix+"register", h.handleUIRegister)
-	mux.HandleFunc("POST "+uiAPIPrefix+"login", h.handleUILogin)
-	mux.HandleFunc("POST "+uiAPIPrefix+"logout", h.handleUILogout)
-	mux.HandleFunc("GET "+uiAPIPrefix+"settings", h.handleUIGetSettings)
-	mux.HandleFunc("PUT "+uiAPIPrefix+"settings", h.handleUISaveSettings)
-	mux.HandleFunc("GET "+uiAPIPrefix+"catalog", h.handleUICatalog)
-	mux.HandleFunc("GET "+uiAPIPrefix+"overview", h.handleUIOverview)
-	mux.HandleFunc("GET "+uiAPIPrefix+"models", h.handleUIListModels)
-	mux.HandleFunc("GET "+uiAPIPrefix+"providers", h.handleUIListProviders)
-	mux.HandleFunc("GET "+uiAPIPrefix+"users", h.handleUIListUsers)
-	mux.HandleFunc("GET "+uiAPIPrefix+"requests", h.handleUIRequests)
-	mux.HandleFunc("GET "+uiAPIPrefix+"converters", h.handleUIConverters)
-	mux.HandleFunc("POST "+uiAPIPrefix+"password", h.handleUIChangePassword)
+	mux.HandleFunc("GET /{$}", h.handlePage)
+	mux.Handle("GET "+assetsPath, http.StripPrefix(assetsPath, assetHandler()))
+	mux.HandleFunc("GET "+apiPrefix+"session", h.handleSession)
+	mux.HandleFunc("GET "+apiPrefix+"registration", h.handleRegistrationStatus)
+	mux.HandleFunc("POST "+apiPrefix+"register", h.handleRegister)
+	mux.HandleFunc("POST "+apiPrefix+"login", h.handleLogin)
+	mux.HandleFunc("POST "+apiPrefix+"logout", h.handleLogout)
+	mux.HandleFunc("GET "+apiPrefix+"settings", h.handleGetSettings)
+	mux.HandleFunc("PUT "+apiPrefix+"settings", h.handleSaveSettings)
+	mux.HandleFunc("GET "+apiPrefix+"catalog", h.handleCatalog)
+	mux.HandleFunc("GET "+apiPrefix+"overview", h.handleOverview)
+	mux.HandleFunc("GET "+apiPrefix+"models", h.handleListModels)
+	mux.HandleFunc("GET "+apiPrefix+"providers", h.handleListProviders)
+	mux.HandleFunc("GET "+apiPrefix+"users", h.handleListUsers)
+	mux.HandleFunc("GET "+apiPrefix+"requests", h.handleRequests)
+	mux.HandleFunc("GET "+apiPrefix+"converters", h.handleConverters)
+	mux.HandleFunc("POST "+apiPrefix+"password", h.handleChangePassword)
 
-	mux.HandleFunc("POST "+uiAPIPrefix+"providers", h.handleUISaveProvider)
-	mux.HandleFunc("GET "+uiAPIPrefix+"providers/{id}", h.handleUIGetProvider)
-	mux.HandleFunc("PUT "+uiAPIPrefix+"providers/{id}", h.handleUISaveProvider)
-	mux.HandleFunc("DELETE "+uiAPIPrefix+"providers/{id}", h.handleUIDeleteProvider)
+	mux.HandleFunc("POST "+apiPrefix+"providers", h.handleSaveProvider)
+	mux.HandleFunc("GET "+apiPrefix+"providers/{id}", h.handleGetProvider)
+	mux.HandleFunc("PUT "+apiPrefix+"providers/{id}", h.handleSaveProvider)
+	mux.HandleFunc("DELETE "+apiPrefix+"providers/{id}", h.handleDeleteProvider)
 
-	mux.HandleFunc("POST "+uiAPIPrefix+"models", h.handleUISaveModel)
-	mux.HandleFunc("GET "+uiAPIPrefix+"models/{id}", h.handleUIGetModel)
-	mux.HandleFunc("PUT "+uiAPIPrefix+"models/{id}", h.handleUISaveModel)
-	mux.HandleFunc("DELETE "+uiAPIPrefix+"models/{id}", h.handleUIDeleteModel)
+	mux.HandleFunc("POST "+apiPrefix+"models", h.handleSaveModel)
+	mux.HandleFunc("GET "+apiPrefix+"models/{id}", h.handleGetModel)
+	mux.HandleFunc("PUT "+apiPrefix+"models/{id}", h.handleSaveModel)
+	mux.HandleFunc("DELETE "+apiPrefix+"models/{id}", h.handleDeleteModel)
 
-	mux.HandleFunc("POST "+uiAPIPrefix+"users", h.handleUISaveUser)
-	mux.HandleFunc("GET "+uiAPIPrefix+"users/{id}", h.handleUIGetUser)
-	mux.HandleFunc("PUT "+uiAPIPrefix+"users/{id}", h.handleUISaveUser)
-	mux.HandleFunc("DELETE "+uiAPIPrefix+"users/{id}", h.handleUIDeleteUser)
+	mux.HandleFunc("POST "+apiPrefix+"users", h.handleSaveUser)
+	mux.HandleFunc("GET "+apiPrefix+"users/{id}", h.handleGetUser)
+	mux.HandleFunc("PUT "+apiPrefix+"users/{id}", h.handleSaveUser)
+	mux.HandleFunc("DELETE "+apiPrefix+"users/{id}", h.handleDeleteUser)
 
-	mux.HandleFunc("GET "+uiAPIPrefix+"keys", h.handleUIListKeys)
-	mux.HandleFunc("POST "+uiAPIPrefix+"keys", h.handleUICreateKey)
-	mux.HandleFunc("DELETE "+uiAPIPrefix+"keys/{id}", h.handleUIDeleteKey)
+	mux.HandleFunc("GET "+apiPrefix+"keys", h.handleListKeys)
+	mux.HandleFunc("POST "+apiPrefix+"keys", h.handleCreateKey)
+	mux.HandleFunc("DELETE "+apiPrefix+"keys/{id}", h.handleDeleteKey)
 
 	// Methodless catch-alls keep method errors and unknown UI API paths in the
 	// Web UI's JSON envelope instead of ServeMux's plain-text response. The
 	// subtree pattern covers every /api/ui path; method-specific routes above
 	// always outrank it.
-	mux.HandleFunc("/{$}", h.handleUIMethodNotAllowed)
-	mux.HandleFunc(uiAssetsPath, h.handleUIMethodNotAllowed)
-	mux.HandleFunc(uiAPIPrefix, h.handleUIMethodNotAllowed)
+	mux.HandleFunc("/{$}", h.handleMethodNotAllowed)
+	mux.HandleFunc(assetsPath, h.handleMethodNotAllowed)
+	mux.HandleFunc(apiPrefix, h.handleMethodNotAllowed)
 }
+
+// HTTP plumbing shared by the console handlers.
+
+func (h *Handler) handleMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	writeError(w, http.StatusMethodNotAllowed, "Method not allowed.", "method_not_allowed")
+}
+
+// parseInt reads a bounded query parameter, falling back to the default when
+// the value is missing or unparsable.
+func parseInt(raw string, fallback, minimum, maximum int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return fallback
+	}
+	return min(max(value, minimum), maximum)
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("cache-control", noStore)
+	w.Header().Set("x-content-type-options", "nosniff")
+	util.WriteJSON(w, status, payload)
+}
+
+func writeError(w http.ResponseWriter, status int, message, code string) {
+	writeJSON(w, status, map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"code":    code,
+		},
+	})
+}
+
+// The console works with the shared configuration types from core.
+
+type (
+	Config        = core.Config
+	Provider      = core.Provider
+	ModelProvider = core.ModelProvider
+	Model         = core.Model
+	User          = core.User
+	Store         = core.Store
+	ProviderInput = core.ProviderInput
+	ModelInput    = core.ModelInput
+	UserInput     = core.UserInput
+)
+
+var ErrNotFound = core.ErrNotFound

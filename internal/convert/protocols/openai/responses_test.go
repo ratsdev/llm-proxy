@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/ratsdev/llm-proxy/internal/convert/ir"
-	"github.com/ratsdev/llm-proxy/internal/convert/protocols"
 	"github.com/ratsdev/llm-proxy/internal/util"
 )
 
@@ -421,7 +420,7 @@ func TestResponsesDecoder(t *testing.T) {
 		t.Fatalf("message block = %+v", events[3])
 	}
 	toolStart := events[5]
-	if toolStart.Index != protocols.ToolBlockIndexBase+2 || toolStart.Block.ToolUseID != "c1" {
+	if toolStart.Index != ir.ToolBlockIndexBase+2 || toolStart.Block.ToolUseID != "c1" {
 		t.Fatalf("tool start = %+v", toolStart)
 	}
 	if events[6].DeltaType != ir.DeltaInputJSON {

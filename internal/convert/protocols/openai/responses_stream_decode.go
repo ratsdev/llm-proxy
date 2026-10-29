@@ -47,7 +47,7 @@ func missingSuffix(seen, full string) string {
 func responseIndex(payload map[string]any, itemType string) int {
 	index, _ := util.AsInt(payload["output_index"])
 	if itemType == "function_call" {
-		return protocols.ToolBlockIndexBase + index
+		return ir.ToolBlockIndexBase + index
 	}
 	return index
 }

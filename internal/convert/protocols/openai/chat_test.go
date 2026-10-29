@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/ratsdev/llm-proxy/internal/convert/ir"
-	"github.com/ratsdev/llm-proxy/internal/convert/protocols"
 	"github.com/ratsdev/llm-proxy/internal/util"
 )
 
@@ -437,7 +436,7 @@ func TestChatStreamDecoder(t *testing.T) {
 			deltas = append(deltas, event)
 		}
 	}
-	if len(starts) != 3 || starts[0].Index != thinkingBlockIndex || starts[1].Index != textBlockIndex || starts[2].Index != protocols.ToolBlockIndexBase+2 {
+	if len(starts) != 3 || starts[0].Index != thinkingBlockIndex || starts[1].Index != textBlockIndex || starts[2].Index != ir.ToolBlockIndexBase+2 {
 		t.Fatalf("starts = %+v", starts)
 	}
 	if starts[2].Block == nil || starts[2].Block.ToolUseID != "c1" || starts[2].Block.ToolName != "f" {
@@ -591,3 +590,42 @@ func FuzzChatParseRequest(f *testing.F) {
 		_, _ = Chat{}.ParseResponse(object)
 	})
 }
+
+// Shared test helpers, also used by responses_test.go: the JSON and SSE
+// assertions are the same for both OpenAI wire formats.
+
+// decodeJSON parses a JSON object literal, failing the test on bad input.
+func decodeJSON(t *testing.T, data string) map[string]any {
+	t.Helper()
+	value, err := util.Decode([]byte(data))
+	if err != nil {
+		t.Fatalf("decode %q: %v", data, err)
+	}
+	object, ok := util.AsMap(value)
+	if !ok {
+		t.Fatalf("expected JSON object, got %T", value)
+	}
+	return object
+}
+
+// frameData returns the data payload of one encoded SSE frame.
+func frameData(t *testing.T, frame []byte) string {
+	t.Helper()
+	text := string(frame)
+	const marker = "data: "
+	index := strings.Index(text, marker)
+	if index < 0 {
+		t.Fatalf("unexpected frame %q", text)
+	}
+	return strings.TrimSuffix(text[index+len(marker):], "\n\n")
+}
+
+// framePayload decodes the data payload of one encoded SSE frame.
+func framePayload(t *testing.T, frame []byte) map[string]any {
+	t.Helper()
+	return decodeJSON(t, frameData(t, frame))
+}
+
+func floatPtr(value float64) *float64 { return &value }
+
+func intPtr(value int) *int { return &value }

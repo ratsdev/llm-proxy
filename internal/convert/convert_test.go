@@ -20,37 +20,6 @@ func object(t *testing.T, raw string) map[string]any {
 	return result
 }
 
-func TestDefinitionsCoverCrossProtocolPairs(t *testing.T) {
-	t.Parallel()
-
-	definitions := Definitions()
-	if len(definitions) != 6 {
-		t.Fatalf("definitions = %v", definitions)
-	}
-	for _, definition := range definitions {
-		parsed, ok := Lookup(definition.ID)
-		if !ok || parsed.From != definition.From || parsed.To != definition.To {
-			t.Fatalf("lookup %q = %+v, ok=%v", definition.ID, parsed, ok)
-		}
-	}
-}
-
-func TestDefinitionForRejectsWrongInbound(t *testing.T) {
-	t.Parallel()
-
-	if _, err := DefinitionFor(ChatCompletions, ClaudeMessagesToOpenAIChat); err == nil {
-		t.Fatal("converter for the wrong inbound format was accepted")
-	}
-	definition, err := DefinitionFor(ChatCompletions, OpenAIChatToClaudeMessages)
-	if err != nil || definition.To != Messages {
-		t.Fatalf("definition = %+v, err=%v", definition, err)
-	}
-	none, err := DefinitionFor(Responses, None)
-	if err != nil || none.To != Responses {
-		t.Fatalf("none definition = %+v, err=%v", none, err)
-	}
-}
-
 func TestChatRequestConvertsToMessages(t *testing.T) {
 	t.Parallel()
 
@@ -244,5 +213,74 @@ func TestStreamErrorFramesPerFormat(t *testing.T) {
 	responses := string(StreamErrorFrames(Responses, "boom")[0])
 	if !strings.Contains(responses, "event: response.failed") || !strings.Contains(responses, "boom") {
 		t.Fatalf("Responses frame = %q", responses)
+	}
+}
+
+// Catalogue: the wire formats and converters configuration validates against.
+
+// Every advertised converter must resolve back to the same direction, so the
+// console, the configuration validator and the dispatch registry cannot drift.
+func TestDefinitionsResolveThroughLookup(t *testing.T) {
+	t.Parallel()
+
+	definitions := Definitions()
+	if len(definitions) != 6 {
+		t.Fatalf("definitions = %v", definitions)
+	}
+	for _, definition := range definitions {
+		parsed, ok := Lookup(definition.ID)
+		if !ok || parsed.From != definition.From || parsed.To != definition.To {
+			t.Fatalf("lookup %q = %+v, ok=%v", definition.ID, parsed, ok)
+		}
+	}
+}
+
+func TestFormatsAreCanonical(t *testing.T) {
+	t.Parallel()
+
+	want := []Format{ChatCompletions, Responses, Messages}
+	got := Formats()
+	if len(got) != len(want) {
+		t.Fatalf("formats = %v", got)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("formats[%d] = %q, want %q", index, got[index], want[index])
+		}
+	}
+}
+
+// DefinitionFor is what configuration validation uses, so it must reject a
+// converter that converts from a different protocol and accept "none" for any
+// inbound format.
+func TestDefinitionFor(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		from    Format
+		id      string
+		want    Format
+		wantErr bool
+	}{
+		{"wrong inbound", ChatCompletions, ClaudeMessagesToOpenAIChat, "", true},
+		{"valid direction", ChatCompletions, OpenAIChatToClaudeMessages, Messages, false},
+		{"none passes through", Responses, None, Responses, false},
+		{"unknown converter", ChatCompletions, "no_such_converter", "", true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			definition, err := DefinitionFor(test.from, test.id)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("DefinitionFor(%q, %q) accepted", test.from, test.id)
+				}
+				return
+			}
+			if err != nil || definition.To != test.want {
+				t.Fatalf("definition = %+v, err = %v", definition, err)
+			}
+		})
 	}
 }

@@ -46,10 +46,12 @@ linters:
       - path: internal/convert/protocols/.*\.go
         linters:
           - gocyclo
-      # These files only re-export types documented in their defining package.
-      - path: (internal/(gateway/core_alias|router/aliases|ui/alias)\.go)
+      # These blocks re-export types documented in their defining package, under
+      # one comment for the whole block. Every other revive rule still applies.
+      - path: internal/(gateway/app|router/router|ui/ui)\.go
         linters:
           - revive
+        text: (should have comment|should be of the form)
       # Forwarding the upstream body and calling the configured upstream are the
       # gateway's purpose; gosec's taint analysis sees them as XSS/SSRF sinks.
       - path: internal/gateway/relay\.go

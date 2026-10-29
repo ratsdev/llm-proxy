@@ -138,76 +138,64 @@ func TestRouterContextCancellationStopsRetries(t *testing.T) {
 	}
 }
 
-func TestRetryDelayClampsHugeAttempt(t *testing.T) {
+func TestRetryDelay(t *testing.T) {
 	t.Parallel()
 
-	router := &Router{rand: func() float64 { return 1 }}
-	if got := router.retryDelay(1000, nil, defaultMaxRetryAfter); got != maxBackoff+maxBackoff/2 {
-		t.Fatalf("retryDelay = %v, want %v", got, maxBackoff+maxBackoff/2)
+	retryAfter := func(value string) http.Header {
+		return http.Header{"Retry-After": []string{value}}
 	}
-}
-
-func TestRetryDelayAddsJitter(t *testing.T) {
-	t.Parallel()
-
-	low := &Router{rand: func() float64 { return 0 }}
-	if got := low.retryDelay(0, nil, defaultMaxRetryAfter); got != 250*time.Millisecond {
-		t.Fatalf("low jitter delay = %v, want 250ms", got)
+	cases := []struct {
+		name    string
+		attempt int
+		header  http.Header
+		cap     time.Duration
+		rand    float64
+		want    time.Duration
+	}{
+		// A huge attempt count must clamp instead of overflowing the backoff.
+		{"huge attempt", 1000, nil, defaultMaxRetryAfter, 1, maxBackoff + maxBackoff/2},
+		{"jitter low", 0, nil, defaultMaxRetryAfter, 0, 250 * time.Millisecond},
+		{"jitter high", 0, nil, defaultMaxRetryAfter, 1, 375 * time.Millisecond},
+		{"retry-after capped by binding", 0, retryAfter("30"), 2 * time.Second, 0, 2 * time.Second},
+		{"absurd retry-after capped by binding", 0, retryAfter("30000000000"), time.Second, 0, time.Second},
 	}
-	high := &Router{rand: func() float64 { return 1 }}
-	if got := high.retryDelay(0, nil, defaultMaxRetryAfter); got != 375*time.Millisecond {
-		t.Fatalf("high jitter delay = %v, want 375ms", got)
-	}
-}
-
-func TestRetryDelayClampsRetryAfterToBindingCap(t *testing.T) {
-	t.Parallel()
-
-	router := &Router{rand: func() float64 { return 0 }}
-	header := http.Header{"Retry-After": []string{"30"}}
-	if got := router.retryDelay(0, header, 2*time.Second); got != 2*time.Second {
-		t.Fatalf("retryDelay = %v, want 2s", got)
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			router := &Router{rand: func() float64 { return test.rand }}
+			if got := router.retryDelay(test.attempt, test.header, test.cap); got != test.want {
+				t.Fatalf("retryDelay = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 
 // A Retry-After far beyond the cooldown cap must not overflow time.Duration into
 // a negative delay: that would retry immediately and also skip the 429 cooldown.
-func TestParseRetryAfterCapsAbsurdValue(t *testing.T) {
+func TestParseRetryAfter(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
-	for _, value := range []string{"30000000000", "99999999999999999999"} {
-		header := http.Header{"Retry-After": []string{value}}
-		delay, ok := parseRetryAfter(header, now)
-		if !ok || delay != maxCooldown {
-			t.Fatalf("Retry-After %q = %v, ok = %v, want %v", value, delay, ok, maxCooldown)
-		}
+	cases := []struct {
+		name  string
+		value string
+		want  time.Duration
+		ok    bool
+	}{
+		{"absurd seconds", "30000000000", maxCooldown, true},
+		{"overflowing seconds", "99999999999999999999", maxCooldown, true},
+		{"http date", now.Add(3 * time.Second).Format(http.TimeFormat), 3 * time.Second, true},
+		{"past date", now.Add(-time.Second).Format(http.TimeFormat), 0, true},
+		{"invalid", "soon", 0, false},
 	}
-
-	router := &Router{rand: func() float64 { return 0 }}
-	header := http.Header{"Retry-After": []string{"30000000000"}}
-	if delay := router.retryDelay(0, header, time.Second); delay != time.Second {
-		t.Fatalf("retryDelay = %v, want the 1s binding cap", delay)
-	}
-}
-
-func TestParseRetryAfterHTTPDate(t *testing.T) {
-	t.Parallel()
-
-	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
-	header := http.Header{"Retry-After": []string{now.Add(3 * time.Second).Format(http.TimeFormat)}}
-	delay, ok := parseRetryAfter(header, now)
-	if !ok || delay != 3*time.Second {
-		t.Fatalf("date delay = %v, ok = %v, want 3s", delay, ok)
-	}
-
-	past := http.Header{"Retry-After": []string{now.Add(-time.Second).Format(http.TimeFormat)}}
-	if delay, ok := parseRetryAfter(past, now); !ok || delay != 0 {
-		t.Fatalf("past date delay = %v, ok = %v, want 0", delay, ok)
-	}
-
-	invalid := http.Header{"Retry-After": []string{"soon"}}
-	if _, ok := parseRetryAfter(invalid, now); ok {
-		t.Fatal("invalid Retry-After should not parse")
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			delay, ok := parseRetryAfter(http.Header{"Retry-After": []string{test.value}}, now)
+			if ok != test.ok || delay != test.want {
+				t.Fatalf("parseRetryAfter(%q) = %v, ok = %v; want %v, ok = %v",
+					test.value, delay, ok, test.want, test.ok)
+			}
+		})
 	}
 }

@@ -440,7 +440,6 @@ The module root is the public surface; everything else lives under `internal/`.
 llmproxy.go                 package llmproxy: Version, NewApp, OpenStore + type aliases
 cmd/llm-proxy/              CLI entry point, flags, startup, shutdown
 internal/
-  version/                  build-time version (ldflags target)
   core/                     configuration, routes, SQLite store, password hashing
   convert/                  converter registry + protocol-neutral IR + adapters
     ir/                     request, response, stream event and usage types
@@ -455,40 +454,40 @@ internal/
 | --- | --- |
 | `llmproxy.go` | Public API: `Version`, `NewApp`, `OpenStore`, `DefaultDatabasePath`, type aliases |
 | `cmd/llm-proxy/` | CLI entry point, flags, startup, graceful shutdown |
-| `internal/version/` | Version string; the only ldflags target |
-| `internal/core/config.go` | Runtime configuration types, endpoint validation, entity builders |
-| `internal/core/wire.go` | Single source of truth for routes and endpoints; aliases `convert.Format` |
-| `internal/core/store.go` | Store lifecycle, password changes, input types, codecs |
+| `internal/core/version.go` | Version string; the only ldflags target |
+| `internal/core/types.go` | Runtime configuration types, wire formats and the editable console DTOs |
+| `internal/core/routes.go` | Single source of truth for routes and endpoints |
+| `internal/core/validate.go` | Endpoint, identifier and timeout validation helpers |
+| `internal/core/build.go` | Entity builders that turn console input into validated configuration |
+| `internal/core/store.go` | Store lifecycle, codecs, password changes |
 | `internal/core/store_load.go` | Configuration snapshot loading (providers, models, users, keys) |
 | `internal/core/store_catalog.go` | Provider and model CRUD with catalog and binding validation |
 | `internal/core/store_accounts.go` | First-administrator registration, self-service member registration, user and API-key CRUD |
 | `internal/core/store_settings.go` | Registration policy settings and defaults in the `settings` table |
-| `internal/core/store_migrate.go` | Schema creation plus migrations for older databases |
+| `internal/core/store_migrate.go` | Schema creation plus migrations for older databases (`store_migrate_endpoints.go`, `store_migrate_legacy.go`) |
 | `internal/core/password.go` | PBKDF2 hashing and verification |
-| `internal/convert/` | Converter registry (`AdapterFor`), request/response entry points, error envelopes |
-| `internal/convert/ir/` | Protocol-neutral types, including the shared usage parser |
-| `internal/convert/protocols/` | Wire-format adapters (`openai/`, `anthropic/`) |
-| `internal/router/router.go` | Candidate selection, routing strategies, dispatch, failover |
+| `internal/convert/` | Converter catalogue (`catalog.go`: formats, IDs, direction validation), registry (`AdapterFor`), request/response entry points, error envelopes |
+| `internal/convert/ir/` | Protocol-neutral types, block helpers, reasoning and the shared usage parser |
+| `internal/convert/protocols/` | Adapter interfaces, usage shaping and stop-reason mapping shared by `openai/` and `anthropic/` |
+| `internal/router/router.go` | Candidate selection, routing strategies, dispatch, failover, upstream headers and timeouts |
 | `internal/router/router_retry.go` | Retry loop, upstream execution, Retry-After and backoff |
 | `internal/router/router_sticky.go` | Sticky cache and 429 cooldowns |
 | `internal/router/session.go` | Conversation-affinity key derivation |
-| `internal/router/router_headers.go` | Upstream headers and per-model/per-provider timeouts |
 | `internal/router/client.go` | Upstream HTTP clients, timeouts, HTTP/SOCKS5 proxies |
-| `internal/gateway/app.go` | `App`: owns the store, console handler and atomically swapped routing stack |
-| `internal/gateway/server.go` | Server construction, route table, console wiring |
+| `internal/gateway/app.go` | `App`: owns the store, console handler and atomically swapped routing stack, plus the core type aliases |
+| `internal/gateway/api.go` | Server construction, route table, index/health/model endpoints, authentication, JSON error envelopes |
 | `internal/gateway/middleware.go` | Request id, panic recovery, access log, response recorder |
-| `internal/gateway/auth.go` | API-key authentication and model allow-list enforcement |
-| `internal/gateway/api_models.go` | Index, health and model listing/retrieval endpoints |
-| `internal/gateway/httpjson.go` | Error envelope rendering, body decoding, inbound protocol headers |
+| `internal/gateway/console_bridge.go` | Console handler wiring and request logging |
 | `internal/gateway/proxy.go` | Inbound request handling; selects and invokes the relay path |
-| `internal/gateway/relay.go` | JSON and SSE relay, stream framing, model-name rewriting |
-| `internal/gateway/relay_usage.go` | Token accounting for passthrough responses and streams |
+| `internal/gateway/relay.go` | JSON and SSE relay, token accounting, response writers |
+| `internal/gateway/relay_stream.go` | Stream framing, conversion and error events |
+| `internal/gateway/upstream.go` | Upstream reply reading, size caps and error mapping |
 | `internal/ui/` | Console handler, sessions, login throttling, dashboard, admin CRUD, embedded assets |
 | `internal/util/` | Client-facing error type, JSON helpers and field rewriting, SSE parser, body/response helpers, `crypto/rand` identifiers |
 
-New wire-format work belongs in `internal/convert/protocols/` and `internal/convert/ir/`; `internal/convert/` exposes the selectable registry and dispatch. Add a converter ID only when the direction is implemented and tested.
+New wire-format work belongs in `internal/convert/protocols/` and `internal/convert/ir/`; `internal/convert/` owns the converter catalogue, the selectable registry and dispatch. Add a converter ID only when the direction is implemented and tested.
 
-Test files sit next to the file they cover (`store_catalog_test.go` beside `store_catalog.go`), and shared fixtures live in `helpers_test.go` per package.
+Tests are grouped by feature, not by source file: each package keeps one `*_test.go` per concern (for example `internal/gateway/api_test.go` covers the HTTP surface, `relay_test.go` the relay paths, `ui_test.go` the console), and fixtures shared inside a package live in `helpers_test.go`.
 
 ## Development
 
@@ -507,7 +506,7 @@ Build with a version string:
 
 ```bash
 go build -trimpath \
-  -ldflags "-s -w -X github.com/ratsdev/llm-proxy/internal/version.Value=1.0.0" \
+  -ldflags "-s -w -X github.com/ratsdev/llm-proxy/internal/core.Value=1.0.0" \
   -o bin/llm-proxy ./cmd/llm-proxy
 ```
 

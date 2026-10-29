@@ -15,14 +15,13 @@ import (
 	"log/slog"
 
 	"github.com/ratsdev/llm-proxy/internal/gateway"
-	"github.com/ratsdev/llm-proxy/internal/version"
 )
 
 // Version is the gateway version reported by the HTTP API and the console. It
-// mirrors internal/version, which is the variable patched at build time:
+// mirrors core.Value, which is the variable patched at build time:
 //
-//	go build -ldflags "-X github.com/ratsdev/llm-proxy/internal/version.Value=1.2.3" ./cmd/llm-proxy
-var Version = version.Value
+//	go build -ldflags "-X github.com/ratsdev/llm-proxy/internal/core.Value=1.2.3" ./cmd/llm-proxy
+var Version = gateway.Version
 
 // Re-exported gateway types, so embedders never import the internal package.
 type (

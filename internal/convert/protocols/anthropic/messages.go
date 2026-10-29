@@ -1,4 +1,3 @@
-// Package anthropic implements the Anthropic Messages wire format.
 package anthropic
 
 import (

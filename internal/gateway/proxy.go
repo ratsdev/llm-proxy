@@ -96,23 +96,3 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, spec routeS
 	}
 	s.relay(w, r, result, relay)
 }
-
-// requestStreamUsage sets stream_options.include_usage on a streamed Chat
-// Completions request. Most providers only append their token usage when the
-// flag is set, and the console derives output throughput from it. It reports
-// whether the flag was added.
-func requestStreamUsage(payload map[string]any, wire WireFormat, stream bool) bool {
-	if !stream || wire != wireChatCompletions {
-		return false
-	}
-	options, _ := util.AsMap(payload["stream_options"])
-	if util.Truthy(options["include_usage"]) {
-		return false
-	}
-	if options == nil {
-		options = make(map[string]any, 1)
-		payload["stream_options"] = options
-	}
-	options["include_usage"] = true
-	return true
-}

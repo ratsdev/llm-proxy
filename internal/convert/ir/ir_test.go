@@ -5,6 +5,19 @@ import (
 	"testing"
 )
 
+func TestJoinText(t *testing.T) {
+	t.Parallel()
+
+	blocks := []Block{
+		TextBlock("hello"),
+		{Type: Video, VideoURL: "https://example.test/v.mp4"},
+		TextBlock("world"),
+	}
+	if got := JoinText(blocks); got != "hello\nworld" {
+		t.Fatalf("JoinText = %q", got)
+	}
+}
+
 func TestUsageMerged(t *testing.T) {
 	t.Parallel()
 
@@ -27,14 +40,21 @@ func TestUsageMerged(t *testing.T) {
 func TestEffortBudgetRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	if EffortForBudget(1000) != "low" || EffortForBudget(1024) != "low" {
-		t.Fatal("low budget mapping")
+	budgets := []struct {
+		tokens int
+		effort string
+	}{
+		{1000, "low"},
+		{1024, "low"},
+		{2048, "medium"},
+		{4096, "high"},
+		{8192, "xhigh"},
+		{20000, "max"},
 	}
-	if EffortForBudget(2048) != "medium" || EffortForBudget(4096) != "high" {
-		t.Fatal("medium/high budget mapping")
-	}
-	if EffortForBudget(8192) != "xhigh" || EffortForBudget(20000) != "max" {
-		t.Fatal("xhigh/max budget mapping")
+	for _, test := range budgets {
+		if got := EffortForBudget(test.tokens); got != test.effort {
+			t.Fatalf("EffortForBudget(%d) = %q, want %q", test.tokens, got, test.effort)
+		}
 	}
 	if budget, ok := BudgetForEffort("minimal"); !ok || budget != 1024 {
 		t.Fatalf("minimal = %d, %v", budget, ok)
@@ -56,19 +76,6 @@ func TestEncryptedReasoningSignature(t *testing.T) {
 	}
 	if IsEncryptedReasoning("real-signature") {
 		t.Fatal("plain signature detected as encrypted")
-	}
-}
-
-func TestJoinText(t *testing.T) {
-	t.Parallel()
-
-	blocks := []Block{
-		TextBlock("hello"),
-		{Type: Video, VideoURL: "https://example.test/v.mp4"},
-		TextBlock("world"),
-	}
-	if got := JoinText(blocks); got != "hello\nworld" {
-		t.Fatalf("JoinText = %q", got)
 	}
 }
 

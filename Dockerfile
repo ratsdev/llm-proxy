@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux \
     go build \
         -trimpath \
-        -ldflags="-s -w -X github.com/ratsdev/llm-proxy/internal/version.Value=${VERSION}" \
+        -ldflags="-s -w -X github.com/ratsdev/llm-proxy/internal/core.Value=${VERSION}" \
         -o /out/llm-proxy ./cmd/llm-proxy
 
 # ---- runtime stage ---------------------------------------------------------
